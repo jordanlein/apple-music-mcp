@@ -50,9 +50,12 @@ export class AppleMusicApi {
     }
     const now = Math.floor(Date.now() / 1000);
     const ttl = Number(this.env.APPLE_DEVELOPER_TOKEN_TTL_SECONDS ?? "3600");
+    if (!Number.isInteger(ttl) || ttl < 300 || ttl > 15_777_000) {
+      throw new Error("APPLE_DEVELOPER_TOKEN_TTL_SECONDS must be an integer from 300 through 15777000.");
+    }
     return signEs256Jwt(
       { alg: "ES256", kid: this.env.APPLE_KEY_ID },
-      { iss: this.env.APPLE_TEAM_ID, iat: now, exp: now + Math.min(ttl, 15_777_000) },
+      { iss: this.env.APPLE_TEAM_ID, iat: now, exp: now + ttl },
       this.env.APPLE_PRIVATE_KEY
     );
   }

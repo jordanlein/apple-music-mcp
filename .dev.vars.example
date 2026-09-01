@@ -1,6 +1,7 @@
-POKE_MCP_API_KEY="replace-with-a-long-random-value"
+MCP_API_KEY="replace-with-a-long-random-value"
 SETUP_TOKEN="replace-with-a-different-long-random-value"
-TOKEN_ENCRYPTION_KEY="replace-with-a-third-long-random-value"
+OAUTH_CONSENT_TOKEN="replace-with-a-third-long-random-value"
+TOKEN_ENCRYPTION_KEY="replace-with-a-fourth-long-random-value"
 APPLE_TEAM_ID="YOUR_APPLE_TEAM_ID"
 APPLE_KEY_ID="YOUR_MEDIA_SERVICES_KEY_ID"
 APPLE_PRIVATE_KEY="-----BEGIN PRIVATE KEY-----

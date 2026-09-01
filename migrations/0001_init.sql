@@ -12,7 +12,7 @@ CREATE TABLE IF NOT EXISTS config (
 
 CREATE TABLE IF NOT EXISTS audit_log (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
-  poke_user_id TEXT,
+  client_id TEXT,
   tool_name TEXT NOT NULL,
   action TEXT NOT NULL,
   detail_json TEXT,

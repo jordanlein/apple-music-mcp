@@ -39,16 +39,35 @@ export async function getConfig(env: Env, key: string): Promise<string | undefin
   return row?.value;
 }
 
+export async function consumeConfigValue(env: Env, key: string, expectedValue: string): Promise<boolean> {
+  const result = await env.DB.prepare("DELETE FROM config WHERE key = ? AND value = ?")
+    .bind(key, expectedValue)
+    .run();
+  return result.meta.changes === 1;
+}
+
 export async function audit(
   env: Env,
-  pokeUserId: string | undefined,
+  clientId: string,
   toolName: string,
   action: string,
   detail: unknown
 ): Promise<void> {
-  await env.DB.prepare(
-    "INSERT INTO audit_log (poke_user_id, tool_name, action, detail_json) VALUES (?, ?, ?, ?)"
-  )
-    .bind(pokeUserId ?? null, toolName, action, JSON.stringify(detail ?? null))
+  try {
+    await env.DB.prepare(
+      "INSERT INTO audit_log (client_id, tool_name, action, detail_json) VALUES (?, ?, ?, ?)"
+    )
+      .bind(clientId, toolName, action, JSON.stringify(detail ?? null))
+      .run();
+  } catch (error) {
+    console.error("Audit insert failed", error instanceof Error ? error.message : String(error));
+  }
+}
+
+export async function purgeAuditLog(env: Env): Promise<void> {
+  const configured = Number(env.AUDIT_RETENTION_DAYS ?? "90");
+  const retentionDays = Number.isInteger(configured) && configured >= 1 && configured <= 3650 ? configured : 90;
+  await env.DB.prepare("DELETE FROM audit_log WHERE created_at < datetime('now', ?)")
+    .bind(`-${retentionDays} days`)
     .run();
 }

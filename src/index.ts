@@ -2,13 +2,27 @@ import { OAuthProvider } from "@cloudflare/workers-oauth-provider";
 import { createMcpHandler } from "agents/mcp";
 import { refreshRecentListeningAnalytics } from "./analytics";
 import { createAppleMusicMcp } from "./mcp";
+import { applySecurityHeaders, HttpRequestError, readCookie, readUrlEncodedForm, secureEqual } from "./http-security";
 import { saveAppleAuthToken, setupPage } from "./setup";
+import { purgeAuditLog } from "./storage";
 import type { Env } from "./types";
+
+const AUTH_FORM_MAX_BYTES = 2_048;
+const OAUTH_CSRF_COOKIE = "AM_MCP_CSRF";
+
+type AuthenticatedProps = {
+  authentication?: string;
+  clientId?: string;
+  userId?: string;
+};
 
 const apiHandler = {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
-    const pokeUserId = request.headers.get("X-Poke-User-Id") ?? undefined;
-    const server = createAppleMusicMcp({ env, pokeUserId });
+    const originError = rejectCrossOriginRequest(request);
+    if (originError) return originError;
+    const props = (ctx.props ?? {}) as AuthenticatedProps;
+    const clientId = props.clientId ?? props.authentication ?? props.userId ?? "authenticated-client";
+    const server = createAppleMusicMcp({ env, clientId });
     return createMcpHandler(server)(request, env, ctx);
   }
 } satisfies ExportedHandler<Env>;
@@ -16,7 +30,6 @@ const apiHandler = {
 const defaultHandler = {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
-    if (request.method === "OPTIONS") return cors(new Response(null, { status: 204 }));
     if (url.pathname === "/") {
       return Response.json({
         name: "Apple Music Custom MCP",
@@ -27,16 +40,17 @@ const defaultHandler = {
       });
     }
     if (url.pathname === "/setup") return setupPage(request, env);
-    if (url.pathname === "/auth/apple/token" && request.method === "POST") return cors(await saveAppleAuthToken(request, env));
+    if (url.pathname === "/auth/apple/token" && request.method === "POST") return saveAppleAuthToken(request, env);
     if (url.pathname === "/authorize") return authorize(request, env);
 
     // Keep the legacy SSE endpoint available to existing clients that use the
     // original static bearer key. Streamable HTTP at /mcp uses OAuth.
     if (url.pathname === "/sse") {
-      const authError = requireMcpApiKey(request, env);
+      const originError = rejectCrossOriginRequest(request);
+      if (originError) return originError;
+      const authError = await requireMcpApiKey(request, env);
       if (authError) return authError;
-      const pokeUserId = request.headers.get("X-Poke-User-Id") ?? undefined;
-      const server = createAppleMusicMcp({ env, pokeUserId });
+      const server = createAppleMusicMcp({ env, clientId: "static-bearer" });
       return createMcpHandler(server)(request, env, ctx);
     }
 
@@ -60,11 +74,11 @@ const oauthProvider = new OAuthProvider<Env>({
     bearer_methods_supported: ["header"],
     resource_name: "Apple Music Custom MCP"
   },
-  // Preserve compatibility for Poke and other trusted clients that already
-  // send the server's static bearer key.
+  // A static bearer key keeps the server usable with any Streamable HTTP MCP
+  // client, including clients that do not implement OAuth discovery.
   async resolveExternalToken({ token, env }) {
-    if (env.POKE_MCP_API_KEY && token === env.POKE_MCP_API_KEY) {
-      return { props: { userId: "owner", authentication: "static-bearer" } };
+    if (env.MCP_API_KEY && await secureEqual(token, env.MCP_API_KEY)) {
+      return { props: { userId: "owner", clientId: "static-bearer", authentication: "static-bearer" } };
     }
     return null;
   }
@@ -78,66 +92,78 @@ export default {
     ctx.waitUntil(
       Promise.all([
         refreshRecentListeningAnalytics(env, { limit: 30 }),
-        oauthProvider.purgeExpiredData(env, { batchSize: 100 })
+        oauthProvider.purgeExpiredData(env, { batchSize: 100 }),
+        purgeAuditLog(env)
       ]).then(() => undefined)
     );
   }
 } satisfies ExportedHandler<Env>;
 
 async function authorize(request: Request, env: Env): Promise<Response> {
+  if (request.method !== "GET" && request.method !== "POST") {
+    return new Response("Method not allowed", { status: 405, headers: { Allow: "GET, POST" } });
+  }
   const oauthRequest = await env.OAUTH_PROVIDER.parseAuthRequest(request);
   const client = await env.OAUTH_PROVIDER.lookupClient(oauthRequest.clientId);
+  const secureCookie = new URL(request.url).protocol === "https:";
 
   if (request.method === "POST") {
-    const form = await request.formData();
-    const csrfCookie = readCookie(request, "__Host-AM_MCP_CSRF");
-    const csrfForm = String(form.get("csrf_token") ?? "");
-    const passcode = String(form.get("passcode") ?? "");
-
-    if (!csrfCookie || !csrfForm || !(await secureEqual(csrfCookie, csrfForm))) {
-      return htmlPage("Authorization failed", "<p>The authorization request expired. Please return to ChatGPT and try again.</p>", 403);
+    let form: URLSearchParams;
+    try {
+      form = await readUrlEncodedForm(request, AUTH_FORM_MAX_BYTES);
+    } catch (error) {
+      if (error instanceof HttpRequestError) return new Response(error.message, { status: error.status });
+      throw error;
     }
-    if (!env.SETUP_TOKEN || !(await secureEqual(passcode, env.SETUP_TOKEN))) {
-      return consentPage(oauthRequest, client?.clientName, csrfCookie, "The access passcode was incorrect.", 401);
+    const csrfCookie = readCookie(request, OAUTH_CSRF_COOKIE);
+    const csrfForm = form.get("csrf_token") ?? "";
+    const passcode = form.get("passcode") ?? "";
+
+    if (csrfForm.length > 128 || passcode.length > 512) {
+      return htmlPage("Authorization failed", "<p>The authorization request contained an invalid field.</p>", 400);
+    }
+    if (!csrfCookie || !csrfForm || !(await secureEqual(csrfCookie, csrfForm))) {
+      return htmlPage("Authorization failed", "<p>The authorization request expired. Return to your MCP client and try again.</p>", 403);
+    }
+    if (!env.OAUTH_CONSENT_TOKEN || !(await secureEqual(passcode, env.OAUTH_CONSENT_TOKEN))) {
+      return consentPage(client?.clientName, csrfCookie, secureCookie, "The authorization passcode was incorrect.", 401);
     }
 
     const { redirectTo } = await env.OAUTH_PROVIDER.completeAuthorization({
       request: oauthRequest,
       userId: "owner",
-      metadata: { clientName: client?.clientName ?? "ChatGPT" },
+      metadata: { clientName: client?.clientName ?? "MCP client" },
       scope: oauthRequest.scope.filter((scope) => scope === "apple_music"),
-      props: { userId: "owner", authentication: "oauth" }
+      props: { userId: "owner", clientId: oauthRequest.clientId, authentication: "oauth" }
     });
     // Some embedded OAuth browsers do not follow a cross-origin redirect after
     // a form POST. A refresh response completes the same top-level navigation.
     const safeRedirect = escapeHtml(redirectTo);
     return new Response(
       `<!doctype html><html lang="en"><meta charset="utf-8"><meta http-equiv="refresh" content="0;url=${safeRedirect}">
-       <title>Authorization complete</title><p>Authorization complete. <a href="${safeRedirect}">Return to ChatGPT</a>.</p></html>`,
+       <title>Authorization complete</title><p>Authorization complete. <a href="${safeRedirect}">Return to your MCP client</a>.</p></html>`,
       {
-        headers: {
+        headers: applySecurityHeaders(new Headers({
           "Content-Type": "text/html; charset=utf-8",
           "Content-Security-Policy": "default-src 'none'; frame-ancestors 'none'; base-uri 'none'",
-          "Referrer-Policy": "no-referrer",
-          "X-Content-Type-Options": "nosniff",
-          "X-Frame-Options": "DENY"
-        }
+          "Set-Cookie": cookieHeader(OAUTH_CSRF_COOKIE, "", 0, secureCookie)
+        }))
       }
     );
   }
 
   const csrfToken = crypto.randomUUID();
-  return consentPage(oauthRequest, client?.clientName, csrfToken);
+  return consentPage(client?.clientName, csrfToken, secureCookie);
 }
 
 function consentPage(
-  _oauthRequest: unknown,
   clientName: string | undefined,
   csrfToken: string,
+  secureCookie: boolean,
   error?: string,
   status = 200
 ): Response {
-  const safeClientName = escapeHtml(clientName ?? "ChatGPT");
+  const safeClientName = escapeHtml(clientName ?? "MCP client");
   const errorHtml = error ? `<p class="error">${escapeHtml(error)}</p>` : "";
   return htmlPage(
     "Authorize Apple Music Custom MCP",
@@ -147,22 +173,19 @@ function consentPage(
        <input type="hidden" name="csrf_token" value="${escapeHtml(csrfToken)}">
        <label for="passcode">Access passcode</label>
        <input id="passcode" name="passcode" type="password" required autocomplete="current-password">
-       <button type="submit">Authorize ChatGPT</button>
+       <button type="submit">Authorize MCP client</button>
      </form>`,
     status,
-    `__Host-AM_MCP_CSRF=${encodeURIComponent(csrfToken)}; HttpOnly; Secure; Path=/; SameSite=Lax; Max-Age=600`
+    cookieHeader(OAUTH_CSRF_COOKIE, csrfToken, 600, secureCookie)
   );
 }
 
 function htmlPage(title: string, body: string, status = 200, cookie?: string): Response {
-  const headers = new Headers({
+  const headers = applySecurityHeaders(new Headers({
     "Content-Type": "text/html; charset=utf-8",
     "Content-Security-Policy":
       "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'",
-    "Referrer-Policy": "no-referrer",
-    "X-Content-Type-Options": "nosniff",
-    "X-Frame-Options": "DENY"
-  });
+  }));
   if (cookie) headers.set("Set-Cookie", cookie);
   return new Response(
     `<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -171,27 +194,6 @@ function htmlPage(title: string, body: string, status = 200, cookie?: string): R
      <main><h1>${escapeHtml(title)}</h1>${body}</main></html>`,
     { status, headers }
   );
-}
-
-function readCookie(request: Request, name: string): string | undefined {
-  for (const part of (request.headers.get("Cookie") ?? "").split(";")) {
-    const [key, ...valueParts] = part.trim().split("=");
-    if (key === name) return decodeURIComponent(valueParts.join("="));
-  }
-  return undefined;
-}
-
-async function secureEqual(left: string, right: string): Promise<boolean> {
-  const encoder = new TextEncoder();
-  const [leftHash, rightHash] = await Promise.all([
-    crypto.subtle.digest("SHA-256", encoder.encode(left)),
-    crypto.subtle.digest("SHA-256", encoder.encode(right))
-  ]);
-  const leftBytes = new Uint8Array(leftHash);
-  const rightBytes = new Uint8Array(rightHash);
-  let difference = 0;
-  for (let index = 0; index < leftBytes.length; index++) difference |= leftBytes[index] ^ rightBytes[index];
-  return difference === 0;
 }
 
 function escapeHtml(value: string): string {
@@ -203,11 +205,15 @@ function escapeHtml(value: string): string {
     .replaceAll("'", "&#039;");
 }
 
-function requireMcpApiKey(request: Request, env: Env): Response | undefined {
-  if (!env.POKE_MCP_API_KEY) return new Response("Server missing POKE_MCP_API_KEY", { status: 500 });
+async function requireMcpApiKey(request: Request, env: Env): Promise<Response | undefined> {
+  if (!env.MCP_API_KEY) return new Response("Server missing MCP_API_KEY", { status: 500 });
   const token = bearerToken(request);
-  if (token === env.POKE_MCP_API_KEY) return undefined;
+  if (token && await secureEqual(token, env.MCP_API_KEY)) return undefined;
   return new Response("Unauthorized", { status: 401 });
+}
+
+function cookieHeader(name: string, value: string, maxAge: number, secure: boolean): string {
+  return `${name}=${encodeURIComponent(value)}; HttpOnly; Path=/; SameSite=Lax; Max-Age=${maxAge}${secure ? "; Secure" : ""}`;
 }
 
 function bearerToken(request: Request): string | undefined {
@@ -216,10 +222,8 @@ function bearerToken(request: Request): string | undefined {
   return match?.[1];
 }
 
-function cors(response: Response): Response {
-  const next = new Response(response.body, response);
-  next.headers.set("Access-Control-Allow-Origin", "*");
-  next.headers.set("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
-  next.headers.set("Access-Control-Allow-Headers", "Content-Type,Authorization");
-  return next;
+function rejectCrossOriginRequest(request: Request): Response | undefined {
+  const origin = request.headers.get("Origin");
+  if (!origin || origin === new URL(request.url).origin) return undefined;
+  return new Response("Cross-origin MCP requests are not allowed", { status: 403 });
 }

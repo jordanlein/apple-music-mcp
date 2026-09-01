@@ -72,6 +72,9 @@ async function encryptionKey(secret: string): Promise<CryptoKey> {
     material = new Uint8Array();
   }
   if (material.byteLength !== 32) {
+    if (textEncoder.encode(secret).byteLength < 32) {
+      throw new Error("TOKEN_ENCRYPTION_KEY must contain at least 32 bytes of random material.");
+    }
     material = new Uint8Array(await crypto.subtle.digest("SHA-256", textEncoder.encode(secret)));
   }
   return crypto.subtle.importKey("raw", toArrayBuffer(material), "AES-GCM", false, ["encrypt", "decrypt"]);
