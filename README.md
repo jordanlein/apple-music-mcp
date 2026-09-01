@@ -398,7 +398,7 @@ Choose this project when remote access, long-running history collection, exact t
 
 ```bash
 npx wrangler whoami
-npx wrangler d1 migrations list poke-apple-music-mcp --remote
+npx wrangler d1 migrations list apple-music-mcp --remote
 npx wrangler secret list
 ```
 
