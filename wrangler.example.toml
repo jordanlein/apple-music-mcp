@@ -1,0 +1,23 @@
+name = "apple-music-mcp"
+main = "src/index.ts"
+compatibility_date = "2026-06-20"
+compatibility_flags = ["nodejs_compat"]
+workers_dev = true
+preview_urls = false
+
+[[kv_namespaces]]
+binding = "OAUTH_KV"
+id = "<YOUR_KV_NAMESPACE_ID>"
+
+[triggers]
+crons = ["*/5 * * * *"]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "apple-music-mcp"
+database_id = "<YOUR_D1_DATABASE_ID>"
+migrations_dir = "migrations"
+
+[vars]
+APPLE_STOREFRONT = "us"
+APPLE_DEVELOPER_TOKEN_TTL_SECONDS = "3600"

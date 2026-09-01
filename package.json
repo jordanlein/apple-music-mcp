@@ -1,0 +1,23 @@
+{
+  "name": "poke-apple-music-mcp",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "test": "node --experimental-strip-types --test test/*.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@cloudflare/workers-oauth-provider": "^0.5.0",
+    "@modelcontextprotocol/sdk": "^1.19.0",
+    "agents": "^0.16.2",
+    "zod": "^4.1.12"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20260620.0",
+    "typescript": "^5.8.3",
+    "wrangler": "^4.24.3"
+  }
+}
