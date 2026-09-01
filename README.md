@@ -284,28 +284,101 @@ The Worker also exposes `/sse` for clients that still use the older endpoint nam
 
 ## Local development
 
-Apply the migrations to Wrangler’s local D1 instance:
+The complete service can run on one machine without deploying a Worker or creating Cloudflare storage. It still uses [Wrangler's local `workerd` runtime](https://developers.cloudflare.com/workers/local-development/) and simulated D1/KV bindings, so this is the same Worker architecture running locally rather than a separate Node server.
+
+### 1. Install and configure
 
 ```bash
-npx wrangler d1 migrations apply apple-music-mcp --local
+git clone https://github.com/jordanlein/apple-music-mcp.git
+cd apple-music-mcp
+npm install
+cp .dev.vars.example .dev.vars
 ```
 
-Create a `.dev.vars` file containing the six Worker secrets. Do not commit it. For a multiline Apple private key, store the key using the syntax supported by the installed Wrangler version or use a local secrets file.
+Edit `.dev.vars` with three strong random values and your Apple Team ID, Media Services key ID, and full `.p8` private key. Keep this file private; it is ignored by Git.
 
-Start the Worker:
+Apply the migrations to Wrangler's local D1 instance:
 
 ```bash
-npm run dev
+npm run db:migrate:local
 ```
+
+Local D1, KV, and authorization state persist under `.wrangler/state`, as described in Cloudflare's [local data documentation](https://developers.cloudflare.com/workers/local-development/local-data/). Back up that directory if the observed history matters; deleting it resets the local service.
+
+### 2. Start and authorize
+
+Start the local Worker with its scheduled-test route enabled:
+
+```bash
+npm run dev:local
+```
+
+Open this URL, substituting the `SETUP_TOKEN` from `.dev.vars`:
+
+```text
+http://localhost:8787/setup?setup_token=<SETUP_TOKEN>
+```
+
+Authorize Apple Music, then configure the MCP client with:
+
+- URL: `http://localhost:8787/mcp`
+- Authorization: `Bearer <POKE_MCP_API_KEY>`
+- Transport: Streamable HTTP
+
+The MCP client must run on the same machine unless you deliberately expose the port over a trusted LAN or secure tunnel. Do not forward port 8787 publicly without TLS and access controls.
+
+### 3. Keep collecting history
+
+Cloudflare Cron Triggers do not automatically fire inside a local Wrangler development session. While `npm run dev:local` is running, trigger one collection pass with:
+
+```bash
+curl -fsS 'http://127.0.0.1:8787/__scheduled?cron=%2A%2F5+%2A+%2A+%2A+%2A'
+```
+
+For continuous history, configure the host's scheduler to make that request every five minutes and keep both the machine and Wrangler process running. The collector can only observe the latest Apple window, so downtime can create permanent gaps. Cloudflare documents the same route in its [local Cron Trigger testing guide](https://developers.cloudflare.com/workers/examples/cron-trigger/#test-cron-triggers-using-wrangler).
+
+### Cloudflare deployment or local machine?
+
+| Consideration | Cloudflare deployment | Local machine |
+| --- | --- | --- |
+| Availability | Always-on remote HTTPS endpoint; best chance of uninterrupted five-minute collection. | Available only while the computer, network, and Wrangler process are running. |
+| History storage | Managed D1 plus a scheduled Worker; data lives in the deployer's Cloudflare account. | Simulated D1/KV under `.wrangler/state`; data stays on the machine but the owner must back it up. |
+| Access | Works with remote MCP clients from anywhere using the bearer key. | Loopback-only by default; remote access needs deliberate networking, TLS, and firewall work. |
+| Cost and limits | Subject to Cloudflare plan quotas and possible usage charges as history and queries grow. | No hosted Cloudflare usage, but consumes local power, disk, and uptime. Apple API limits still apply. |
+| Secret isolation | Worker secrets are managed separately from the encrypted D1 token. | `.dev.vars`, the encryption key, and encrypted database are on the same host; OS account and disk security matter. |
+| Maintenance | Cloudflare runs the process and Cron Trigger; deployments and schema migrations remain the owner's job. | The owner runs the process, scheduler, backups, updates, and recovery. |
+| Best fit | The recommended mode for durable indefinite history and remote agents. | Privacy-focused experimentation, development, or an always-on trusted home server. |
+
+Neither mode can backfill plays from before collection began. Both require internet access to Apple Music, and both are single-user per deployment.
 
 Useful project commands:
 
 ```bash
 npm test
 npm run typecheck
+npm run dev:local
+npm run db:migrate:local
 npx wrangler deploy --dry-run
 npx wrangler tail
 ```
+
+## Comparison with other Apple Music MCP servers
+
+This project is optimized for a remote agent that needs durable, queryable listening history and conservative playlist writes. Many other Apple Music MCPs optimize instead for controlling a local Music app or providing the widest possible playback and library surface.
+
+The comparison below reflects the projects' published READMEs as checked on August 31, 2026; those projects may change.
+
+| Project | Architecture and Apple access | Strengths | Main tradeoff versus this project |
+| --- | --- | --- | --- |
+| **This project** | Remote Streamable HTTP on Cloudflare, or local `workerd`; Apple's documented MusicKit/Apple Music API with a user-authorized token. | Indefinite observed-event ledger, preset/custom timeframes, stable pagination, SQL analytics, official Replay, five-minute collection, encrypted token storage, and guarded create/add playlist writes. | No playback, queue, volume, rating, removal, or playlist-deletion controls; requires an Apple Developer MusicKit key. |
+| [epheterson/applemusic-mcp](https://github.com/epheterson/applemusic-mcp) | Local Python MCP with native Music.app, Apple API, Safari, and Chrome engines. | Broadest control surface of this set: playback, Up Next, ratings, folders, library management, and cross-platform browser/API modes. | More local/browser integration and a larger trust surface; its README does not describe a durable timestamped history ledger or Cloudflare-hosted remote endpoint. |
+| [kennethreitz/mcp-applemusic](https://github.com/kennethreitz/mcp-applemusic) | Local Python/FastMCP server controlling Music.app through AppleScript on macOS. | Very simple installation and direct playback/library control without Cloudflare or Apple API credentials. | macOS-only, must run beside Music.app, and does not claim remote hosting, personalized Apple API data, Replay, or persistent history analytics. |
+| [popand/AppleMusicMCP](https://github.com/popand/AppleMusicMCP) | Local Node stdio server using the documented Apple Music API and browser MusicKit authorization. | Catalog, library, recommendations, recently played, and straightforward playlist creation/addition using official API credentials. | Local client process with current recently-played results only; its README does not describe continuous collection, an indefinite ledger, custom timeframes, or SQL analytics. |
+| [akr4/applemusic-mcp-server](https://github.com/akr4/applemusic-mcp-server) | Local Rust server using an Apple developer token. | Small, focused catalog search and Apple Music deep-link generation. | Catalog-oriented only; no music-user authorization, personal library, recommendations, playlist writes, Replay, or history ledger is documented. |
+
+There are also projects that obtain web-player credentials through browser automation. They can avoid an Apple Developer membership or unlock controls absent from Apple's public API, but they rely on undocumented web behavior and token-capture flows. This project intentionally stays on Apple's documented API and MusicKit authorization surfaces.
+
+Choose this project when remote access, long-running history collection, exact timeframes, and bounded analytics matter most. Choose a local Music.app MCP when immediate playback control and zero cloud setup matter more. Choose a broader hybrid MCP when playback, queue, ratings, deletion, and cross-platform browser control outweigh the operational simplicity of a narrower API surface.
 
 ## Routes
 
@@ -387,6 +460,7 @@ src/
   types.ts            Worker and Apple API types
 migrations/           D1 schema migrations
 test/                 Snapshot, timeframe, pagination, matching, and metadata tests
+wrangler.local.toml   Local-only simulated D1/KV configuration
 wrangler.example.toml Public Worker, D1, KV, variables, and cron template
 wrangler.toml         Local deployment configuration (ignored by Git)
 ```

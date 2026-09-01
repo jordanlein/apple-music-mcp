@@ -5,6 +5,8 @@
   "type": "module",
   "scripts": {
     "dev": "wrangler dev",
+    "dev:local": "wrangler dev --config wrangler.local.toml --local --test-scheduled",
+    "db:migrate:local": "wrangler d1 migrations apply apple-music-mcp-local --local --config wrangler.local.toml",
     "deploy": "wrangler deploy",
     "test": "node --experimental-strip-types --test test/*.test.ts",
     "typecheck": "tsc --noEmit"

@@ -1,0 +1,8 @@
+POKE_MCP_API_KEY="replace-with-a-long-random-value"
+SETUP_TOKEN="replace-with-a-different-long-random-value"
+TOKEN_ENCRYPTION_KEY="replace-with-a-third-long-random-value"
+APPLE_TEAM_ID="YOUR_APPLE_TEAM_ID"
+APPLE_KEY_ID="YOUR_MEDIA_SERVICES_KEY_ID"
+APPLE_PRIVATE_KEY="-----BEGIN PRIVATE KEY-----
+PASTE_THE_CONTENTS_OF_YOUR_P8_FILE_HERE
+-----END PRIVATE KEY-----"
