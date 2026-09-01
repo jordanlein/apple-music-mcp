@@ -10,8 +10,10 @@ export interface Env {
   APPLE_STOREFRONT?: string;
   APPLE_DEVELOPER_TOKEN_TTL_SECONDS?: string;
   TOKEN_ENCRYPTION_KEY: string;
-  POKE_MCP_API_KEY: string;
+  MCP_API_KEY: string;
   SETUP_TOKEN: string;
+  OAUTH_CONSENT_TOKEN: string;
+  AUDIT_RETENTION_DAYS?: string;
 }
 
 export interface AppleTokenSet {
@@ -21,7 +23,7 @@ export interface AppleTokenSet {
 
 export interface ToolContext {
   env: Env;
-  pokeUserId?: string;
+  clientId: string;
 }
 
 export interface AppleArtwork {

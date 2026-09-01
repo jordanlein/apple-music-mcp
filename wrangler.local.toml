@@ -1,7 +1,10 @@
 name = "apple-music-mcp-local"
 main = "src/index.ts"
 compatibility_date = "2026-06-20"
-compatibility_flags = ["nodejs_compat"]
+compatibility_flags = ["nodejs_compat", "global_fetch_strictly_public"]
+
+[secrets]
+required = ["MCP_API_KEY", "SETUP_TOKEN", "OAUTH_CONSENT_TOKEN", "TOKEN_ENCRYPTION_KEY", "APPLE_TEAM_ID", "APPLE_KEY_ID", "APPLE_PRIVATE_KEY"]
 
 [[kv_namespaces]]
 binding = "OAUTH_KV"
@@ -16,3 +19,4 @@ migrations_dir = "migrations"
 [vars]
 APPLE_STOREFRONT = "us"
 APPLE_DEVELOPER_TOKEN_TTL_SECONDS = "3600"
+AUDIT_RETENTION_DAYS = "90"

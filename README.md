@@ -1,158 +1,95 @@
 # Apple Music MCP on Cloudflare
 
-A remote Model Context Protocol (MCP) server that lets an AI agent safely work with one Apple Music account. It runs as a Cloudflare Worker, stores authorization and observed listening history in Cloudflare D1, and uses only Apple’s official MusicKit and Apple Music API surfaces.
+Connect Apple Music to any MCP client that supports remote Streamable HTTP servers.
 
-The server can:
+This self-hosted server runs on Cloudflare Workers, keeps its state in your own D1 database, and uses Apple’s documented MusicKit and Apple Music API surfaces. One deployment connects to one Apple Music account.
 
-- Read indefinitely retained observed history by presets or an exact custom date range.
-- Read heavy rotation and personalized Apple Music recommendations.
-- Read official Apple Music Replay summaries.
-- List library playlists and their tracks.
-- Search the Apple Music catalog.
-- Create playlists and append tracks, with duplicate checks and dry-run support.
-- Build observed listening summaries and rankings by track, artist, album, or genre.
-- Keep collecting recently played history every five minutes without an agent calling the MCP.
+## Why use it
 
-## Deployment model
-
-Each deployment connects to one Apple Music account and keeps its data in that deployer's own Cloudflare D1 database. MCP requests require `POKE_MCP_API_KEY`, and the browser setup flow requires `SETUP_TOKEN`. Nothing in the repository grants access to an existing deployment, Apple account, or listening history.
+- Search the Apple Music catalog and inspect a connected library.
+- Read playlists, recommendations, heavy rotation, and official Replay summaries.
+- Create playlists and safely append tracks with preview, matching, and duplicate checks.
+- Collect recently played tracks every five minutes into an indefinitely retained observed-history ledger.
+- Query bounded history pages, summaries, and rankings for preset or exact timeframes.
+- Connect with either a static bearer key or MCP OAuth discovery.
+- Keep Apple credentials in Worker secrets and encrypt the Apple music user token before D1 storage.
 
 ## How it works
 
 ```mermaid
 flowchart LR
-    Client["MCP client or AI agent"] -->|"Bearer API key"| Worker["Cloudflare Worker"]
-    Worker -->|"Developer token + encrypted user token"| Apple["Apple Music API"]
+    Client["Remote MCP client"] -->|"Streamable HTTP + bearer or OAuth"| Worker["Cloudflare Worker"]
+    Setup["Protected browser setup"] -->|"MusicKit authorization"| Worker
+    Worker -->|"Developer token + music user token"| Apple["Apple Music API"]
     Worker --> D1["Cloudflare D1"]
-    Setup["Browser setup page<br/>MusicKit authorization"] --> Worker
-    Cron["Cloudflare cron<br/>every 5 minutes"] --> Worker
-    D1 --> History["Observed listening history<br/>analytics state<br/>audit log"]
+    Worker --> KV["OAuth KV"]
+    Cron["Five-minute cron"] --> Worker
+    D1 --> Data["Observed history, analytics, audit log"]
 ```
 
-The Worker signs short-lived Apple developer tokens using the configured Media Services private key. The browser setup page uses MusicKit to obtain the account’s music user token, which is encrypted with AES-GCM before being stored in D1.
+The Worker signs short-lived ES256 Apple developer tokens. Browser setup obtains a music user token, encrypts it with AES-GCM, and stores only the ciphertext in D1. A scheduled handler compares Apple’s current recently played window with the preceding snapshot and stores newly observed events.
 
-Cloudflare’s scheduled handler fetches Apple’s latest 30 played tracks every five minutes. It compares consecutive snapshots and stores the newly observed prefix, allowing repeated tracks to become separate observed events.
+## Choose a deployment
 
-## MCP tools
-
-The server currently exposes 14 tools.
-
-| Tool | Capability | Important inputs |
+| | Cloudflare deployment | Local development |
 | --- | --- | --- |
-| `apple_music_status` | Check Apple credentials, account connection, token age, and storefront. | None |
-| `apple_music_recently_played` | Page through D1-backed history from any observed timeframe. | `preset` or `start`/`end`, `limit`, `cursor`, `refreshFirst` |
-| `apple_music_heavy_rotation` | Read Apple Music heavy rotation, similar to “On Repeat.” | `limit` up to 10 |
-| `apple_music_recommendations` | Read personalized recommendation groups. | `limit` up to 10 |
-| `apple_music_replay_summary` | Read official latest-year Replay totals and top content. | None |
-| `apple_music_list_playlists` | List library playlists and whether each is editable. | `limit` up to 500 |
-| `apple_music_get_playlist_tracks` | Read tracks from a library playlist. | `playlistId`, `limit` |
-| `apple_music_search_catalog` | Search songs, albums, artists, playlists, or music videos in the user’s storefront. | `term`, `types`, `limit` |
-| `apple_music_create_playlist` | Create a new library playlist. | `name`, `description` |
-| `apple_music_add_tracks_to_playlist` | Safely resolve, preflight, deduplicate, and append up to 100 tracks. | `playlistId`, `tracks`, `dryRun`, `allowPartial` |
-| `apple_music_analytics_refresh` | Manually refresh the observed listening ledger. | `limit` up to 30 |
-| `apple_music_analytics_status` | Inspect ledger coverage and recent ingest runs. | None |
-| `apple_music_listening_summary` | Build SQL-side observed totals and top items for any timeframe. | `preset` or `start`/`end` |
-| `apple_music_top_stats` | Rank tracks, artists, albums, or genres for any timeframe. | `preset` or `start`/`end`, `kind`, `limit` |
+| MCP URL | Public HTTPS Worker URL | `http://127.0.0.1:8787/mcp` |
+| Availability | Always on | Only while Wrangler and the computer are running |
+| History collection | Automatic five-minute Cron Trigger | Requires manual or host-scheduled calls to the local scheduled-test route |
+| Storage | Managed D1 and KV in your Cloudflare account | Simulated D1 and KV under `.wrangler/state` |
+| Best use | Normal remote access and durable collection | Development, testing, or a deliberately managed private host |
 
-### Recently played query examples
-
-Request the first 20 songs observed during the last 30 days:
-
-```json
-{
-  "preset": "30d",
-  "limit": 20
-}
-```
-
-Request a custom Mountain Time range:
-
-```json
-{
-  "start": "2026-08-01T00:00:00-06:00",
-  "end": "2026-08-15T00:00:00-06:00",
-  "limit": 50
-}
-```
-
-Request all observed history:
-
-```json
-{
-  "preset": "all_time",
-  "limit": 50
-}
-```
-
-Presets are `today`, `24h`, `7d`, `30d`, `90d`, `ytd`, `last_year`, and `all_time`. Use either one preset or a custom inclusive `start` and optional exclusive `end`; custom timestamps must include `Z` or a UTC offset. Calendar presets default to `America/Denver`, with an optional IANA `timeZone` override.
-
-History responses are deliberately bounded to 200 tracks and default to 50. When `coverage.hasMore` is true, pass the returned `nextCursor`; it carries the original fixed range so rolling presets cannot shift between pages. Summary and ranking tools aggregate inside D1 and do not return or load the full event ledger.
-
-### Playlist write behavior
-
-The write surface is intentionally conservative:
-
-- The server can create a playlist.
-- It can append tracks to an editable library playlist.
-- It compares up to 10 catalog candidates per requested song and verifies title, artist, and version.
-- It rejects unintended remixes, live recordings, covers, and other variants.
-- It reports unresolved and ambiguous requests instead of silently substituting or dropping them.
-- It checks the current playlist and the incoming batch for duplicate catalog IDs.
-- By default, one unresolved or ambiguous request blocks the entire write; `allowPartial: true` requires an explicit decision to skip questionable songs.
-- `dryRun: true` resolves and deduplicates tracks without changing Apple Music and should be used before large or important writes.
-- A completed write is read back with bounded retries. If Apple has accepted the append but its eventually consistent library read has not caught up, the tool reports `pending_apple_propagation` rather than incorrectly claiming verification failed.
-- It does not remove tracks, reorder tracks, insert at a position, edit playlist metadata, or delete playlists.
-
-## Listening-history accuracy
-
-Apple’s recently played endpoint is not a historical export. It returns at most 30 tracks and does not include a play timestamp.
-
-Consequently:
-
-- History cannot be backfilled retroactively.
-- `observedAt` is estimated within the five-minute interval in which the Worker first detected a song.
-- If all 30 upstream slots change between polls, the collector flags a possible coverage gap.
-- Every observed listen event is retained indefinitely; no automatic event-expiration query exists.
-- Existing event rows and their raw payloads remain untouched. Future events keep normalized per-play data and reference a content-addressed raw payload version, so identical JSON is stored once while every changed version remains recoverable.
-- Any timeframe is incomplete unless the collector has actually covered that entire period without an upstream polling gap.
-- `apple_music_replay_summary` is the correct tool for authoritative latest-year Replay totals.
+Cloudflare is the recommended deployment. Neither mode can backfill listening activity from before collection begins.
 
 ## Prerequisites
 
 You need:
 
-- Node.js and npm.
-- A Cloudflare account with Workers and D1 access.
-- An Apple Developer account with permission to create Media IDs and Media Services keys.
-- An Apple Music subscription for the account being connected.
-- An MCP client that supports remote Streamable HTTP servers.
+- Node.js 22.18 or newer and npm.
+- A Cloudflare account with Workers, D1, and KV access.
+- An Apple Developer Program account with Account Holder or Admin access for Media IDs and keys.
+- An active Apple Music subscription for the account you will connect.
+- An MCP client that supports remote Streamable HTTP servers. OAuth support is optional because a static bearer key is also available.
 
-In the Apple Developer portal:
+## Part 1: Create Apple credentials
 
-1. Register a Media ID under Certificates, Identifiers & Profiles.
-2. Enable the Apple Music/MusicKit service for that identifier.
-3. Create a Media Services private key associated with the Media ID.
-4. Download the `.p8` private key immediately; Apple does not allow it to be downloaded again.
-5. Record the key ID and Apple Developer team ID.
+In [Certificates, Identifiers & Profiles](https://developer.apple.com/account/resources/identifiers/list):
 
-## Fresh Cloudflare setup
+1. Open **Identifiers** and select **+**.
+2. Choose **Media IDs** and continue.
+3. Enter a user-facing description and a reverse-domain identifier.
+4. Enable the Apple Music or MusicKit service and register the Media ID.
+5. Open **Keys**, select **+**, and create a key with **Media Services** enabled.
+6. Associate the key with the Media ID.
+7. Download the `.p8` private key immediately. Apple does not allow another download later.
+8. Record the key ID and your Apple Developer team ID.
 
-These steps create an independent deployment in your Cloudflare account.
+Keep the `.p8` file private. The server needs its complete contents, including the `BEGIN PRIVATE KEY` and `END PRIVATE KEY` lines.
 
-### 1. Install dependencies and sign in
+## Part 2: Deploy to Cloudflare
+
+### 1. Get the project
 
 ```bash
-npm install
-npx wrangler login
+git clone https://github.com/CONTRIBUTOR/apple-music-mcp.git
+cd apple-music-mcp
+npm ci
 ```
 
-### 2. Create Cloudflare storage and local configuration
+### 2. Sign in to Cloudflare
 
-Copy the public configuration template:
+```bash
+npx wrangler login
+npx wrangler whoami
+```
+
+### 3. Create the deployment configuration
 
 ```bash
 cp wrangler.example.toml wrangler.toml
 ```
+
+`wrangler.toml` is ignored by Git. Keep it local.
 
 Create the OAuth KV namespace:
 
@@ -160,11 +97,15 @@ Create the OAuth KV namespace:
 npx wrangler kv namespace create OAUTH_KV
 ```
 
-Copy the returned namespace ID into the `OAUTH_KV` entry in your local `wrangler.toml`.
+Copy the returned namespace ID into this block in `wrangler.toml`:
+
+```toml
+[[kv_namespaces]]
+binding = "OAUTH_KV"
+id = "<YOUR_KV_NAMESPACE_ID>"
+```
 
 Create the D1 database:
-
-Create a database:
 
 ```bash
 npx wrangler d1 create apple-music-mcp
@@ -180,89 +121,138 @@ database_id = "<YOUR_D1_DATABASE_ID>"
 migrations_dir = "migrations"
 ```
 
-Apply the schema:
+### 4. Create the secrets
+
+Generate four different random values. Use a password manager or run this command four times:
 
 ```bash
-npx wrangler d1 migrations apply apple-music-mcp --remote
+openssl rand -base64 32
 ```
 
-The migrations create:
+Store each value under a different name:
 
-- `auth_tokens` for the encrypted Apple music user token.
-- `config` for authorization state and the cached storefront.
-- `listen_events` for indefinitely retained normalized listening events.
-- `track_resource_versions` for content-addressed Apple payload versions, deduplicating identical future metadata while preserving every distinct payload and linking it to the listen event.
-- `analytics_state` for snapshot comparison state.
-- `analytics_ingest_runs` for collector health and coverage.
-- `audit_log` for MCP read and write activity.
+| Secret | Purpose |
+| --- | --- |
+| `MCP_API_KEY` | Static bearer key for `/mcp` and `/sse`. |
+| `SETUP_TOKEN` | Unlocks the short-lived browser setup session. |
+| `OAUTH_CONSENT_TOKEN` | Approves MCP OAuth clients; keep it distinct from `SETUP_TOKEN`. |
+| `TOKEN_ENCRYPTION_KEY` | Encrypts the Apple music user token stored in D1. Keep it for the lifetime of that token. |
+| `APPLE_TEAM_ID` | Apple Developer team identifier used as JWT issuer. |
+| `APPLE_KEY_ID` | Media Services private-key identifier. |
+| `APPLE_PRIVATE_KEY` | Complete contents of the downloaded `.p8` file. |
 
-### 3. Configure Worker secrets
-
-Set all six secrets interactively:
+Set them interactively so they do not appear in shell history:
 
 ```bash
-npx wrangler secret put POKE_MCP_API_KEY
+npx wrangler secret put MCP_API_KEY
 npx wrangler secret put SETUP_TOKEN
+npx wrangler secret put OAUTH_CONSENT_TOKEN
 npx wrangler secret put TOKEN_ENCRYPTION_KEY
 npx wrangler secret put APPLE_TEAM_ID
 npx wrangler secret put APPLE_KEY_ID
 npx wrangler secret put APPLE_PRIVATE_KEY
 ```
 
-Secret meanings:
+Do not put secret values in `wrangler.toml`, source files, issue reports, or copied terminal output.
 
-| Secret | Purpose |
-| --- | --- |
-| `POKE_MCP_API_KEY` | Bearer token required for every `/mcp` and `/sse` request. |
-| `SETUP_TOKEN` | Protects the browser-based `/setup` route. |
-| `TOKEN_ENCRYPTION_KEY` | Encrypts the Apple music user token stored in D1. Use a strong random value and preserve it for the lifetime of the stored token. |
-| `APPLE_TEAM_ID` | Apple Developer team identifier used as the developer-token issuer. |
-| `APPLE_KEY_ID` | Identifier of the Media Services private key. |
-| `APPLE_PRIVATE_KEY` | Full PKCS#8 contents of the downloaded `.p8` file, including its header and footer. |
-
-Generate strong random values for the first three secrets with a password manager or a command such as:
+### 5. Apply the database schema
 
 ```bash
-openssl rand -base64 32
+npx wrangler d1 migrations list apple-music-mcp --remote
+npx wrangler d1 migrations apply apple-music-mcp --remote
 ```
 
-Never commit these values. The project ignores `work/`, `.wrangler/`, `.dev.vars`, and the local `wrangler.toml` deployment configuration.
+The migrations create:
 
-### 4. Validate and deploy
+- `auth_tokens` for the encrypted Apple music user token.
+- `config` for short-lived authorization state and the cached storefront.
+- `listen_events` for normalized observed listening events.
+- `track_resource_versions` for deduplicated raw Apple payload versions.
+- `analytics_state` and `analytics_ingest_runs` for collection state and health.
+- `audit_log` for bounded MCP activity records.
+
+### 6. Validate and deploy
 
 ```bash
 npm test
 npm run typecheck
-npx wrangler d1 migrations apply apple-music-mcp --remote
 npx wrangler deploy --dry-run
 npm run deploy
 ```
 
-Apply migrations before deploying a Worker version that references a new table. Migrations `0003_indefinite_history.sql` and `0004_resource_versions.sql` create the compact resource archive and replacement history index; they do not update or delete any `listen_events` rows or existing inline raw payloads.
-
-The deploy output prints the Worker URL. The MCP endpoint is that URL plus `/mcp`.
-
-### 5. Authorize Apple Music
-
-Open:
+The deploy output prints a URL such as:
 
 ```text
-https://<YOUR_WORKER>.workers.dev/setup?setup_token=<SETUP_TOKEN>
+https://apple-music-mcp.<YOUR_SUBDOMAIN>.workers.dev
 ```
 
-Select **Authorize Apple Music** and complete Apple’s prompt. The setup page sends the resulting music user token directly to the Worker, which encrypts it before saving it in D1.
+Your primary MCP endpoint is:
 
-Apple does not issue a refresh token for this flow. If Apple access later expires, open the same setup URL and authorize again. In practice, this may be needed roughly every six months.
+```text
+https://apple-music-mcp.<YOUR_SUBDOMAIN>.workers.dev/mcp
+```
 
-### 6. Verify the connection
+### 7. Connect the Apple Music account
 
-Configure an MCP client with:
+Open this clean URL in a browser:
 
-- URL: `https://<YOUR_WORKER>.workers.dev/mcp`
-- Authorization header: `Bearer <POKE_MCP_API_KEY>`
-- Transport: Streamable HTTP
+```text
+https://apple-music-mcp.<YOUR_SUBDOMAIN>.workers.dev/setup
+```
 
-Then call `apple_music_status`. A healthy connection reports:
+Then:
+
+1. Enter `SETUP_TOKEN` in the protected form.
+2. Select **Authorize Apple Music**.
+3. Complete Apple’s authorization prompt.
+4. Wait for **Apple Music connected**.
+
+The setup token is submitted in a POST body and exchanged for a ten-minute HttpOnly session. Do not add the token to the URL. The Apple authorization state is hashed at rest, bound to that browser session, expires after ten minutes, and is consumed once.
+
+Apple does not provide a refresh token for the music user token. If access later expires, return to `/setup` and authorize again.
+
+### 8. Connect an MCP client
+
+Use one of the following authentication modes.
+
+#### Option A: Static bearer key
+
+Enter these fields in the client’s remote MCP server form:
+
+- Name: `Apple Music`
+- URL: `https://apple-music-mcp.<YOUR_SUBDOMAIN>.workers.dev/mcp`
+- Transport: `Streamable HTTP`
+- Header name: `Authorization`
+- Header value: `Bearer <MCP_API_KEY>`
+
+If the client accepts JSON configuration, adapt this generic shape to its field names:
+
+```json
+{
+  "name": "Apple Music",
+  "url": "https://apple-music-mcp.<YOUR_SUBDOMAIN>.workers.dev/mcp",
+  "transport": "streamable-http",
+  "headers": {
+    "Authorization": "Bearer <MCP_API_KEY>"
+  }
+}
+```
+
+#### Option B: MCP OAuth
+
+For a client that implements MCP OAuth discovery:
+
+1. Add only the `/mcp` URL.
+2. Start the client’s authorization flow.
+3. In the browser consent page, confirm the displayed client name.
+4. Enter `OAUTH_CONSENT_TOKEN`.
+5. Return to the client after authorization completes.
+
+OAuth uses S256 PKCE, one-hour access tokens, 30-day refresh tokens, and the single `apple_music` scope. One deployment is intentionally one owner and one Apple Music account; every authorized client receives the same tool set.
+
+### 9. Verify the connection
+
+Call `apple_music_status`. A healthy result resembles:
 
 ```json
 {
@@ -272,161 +262,223 @@ Then call `apple_music_status`. A healthy connection reports:
 }
 ```
 
-For Poke, the existing project used:
-
-```bash
-npx poke@latest mcp add https://<YOUR_WORKER>.workers.dev/mcp \
-  -n "Apple Music" \
-  -k "<POKE_MCP_API_KEY>"
-```
-
-The Worker also exposes `/sse` for clients that still use the older endpoint name.
+Then call `apple_music_analytics_status` to verify that the history collector can read its D1 state.
 
 ## Local development
-
-The complete service can run on one machine without deploying a Worker or creating Cloudflare storage. It still uses [Wrangler's local `workerd` runtime](https://developers.cloudflare.com/workers/local-development/) and simulated D1/KV bindings, so this is the same Worker architecture running locally rather than a separate Node server.
 
 ### 1. Install and configure
 
 ```bash
-git clone https://github.com/CONTRIBUTOR/apple-music-mcp.git
-cd apple-music-mcp
-npm install
+npm ci
 cp .dev.vars.example .dev.vars
 ```
 
-Edit `.dev.vars` with three strong random values and your Apple Team ID, Media Services key ID, and full `.p8` private key. Keep this file private; it is ignored by Git.
+Edit `.dev.vars` with four different random values plus the Apple team ID, key ID, and complete private key. `.dev.vars` is ignored by Git.
 
-Apply the migrations to Wrangler's local D1 instance:
+Apply the local migrations:
 
 ```bash
 npm run db:migrate:local
 ```
 
-Local D1, KV, and authorization state persist under `.wrangler/state`, as described in Cloudflare's [local data documentation](https://developers.cloudflare.com/workers/local-development/local-data/). Back up that directory if the observed history matters; deleting it resets the local service.
-
-### 2. Start and authorize
-
-Start the local Worker with its scheduled-test route enabled:
+### 2. Start the Worker
 
 ```bash
 npm run dev:local
 ```
 
-Open this URL, substituting the `SETUP_TOKEN` from `.dev.vars`:
+Keep this process running. Open:
 
 ```text
-http://localhost:8787/setup?setup_token=<SETUP_TOKEN>
+http://127.0.0.1:8787/setup
 ```
 
-Authorize Apple Music, then configure the MCP client with:
+Enter the local `SETUP_TOKEN`, authorize Apple Music, and connect a client to:
 
-- URL: `http://localhost:8787/mcp`
-- Authorization: `Bearer <POKE_MCP_API_KEY>`
-- Transport: Streamable HTTP
+```text
+http://127.0.0.1:8787/mcp
+```
 
-The MCP client must run on the same machine unless you deliberately expose the port over a trusted LAN or secure tunnel. Do not forward port 8787 publicly without TLS and access controls.
+Use `Authorization: Bearer <MCP_API_KEY>` unless the client supports the local OAuth flow.
 
-### 3. Keep collecting history
+Do not expose port 8787 publicly. The server rejects browser requests whose `Origin` does not match the server origin, but local network binding, TLS, and firewall policy remain the operator’s responsibility.
 
-Cloudflare Cron Triggers do not automatically fire inside a local Wrangler development session. While `npm run dev:local` is running, trigger one collection pass with:
+### 3. Trigger local collection
+
+Wrangler does not automatically fire Cron Triggers in a local session. While `npm run dev:local` is running, trigger one collection pass with:
 
 ```bash
 curl -fsS 'http://127.0.0.1:8787/__scheduled?cron=%2A%2F5+%2A+%2A+%2A+%2A'
 ```
 
-For continuous history, configure the host's scheduler to make that request every five minutes and keep both the machine and Wrangler process running. The collector can only observe the latest Apple window, so downtime can create permanent gaps. Cloudflare documents the same route in its [local Cron Trigger testing guide](https://developers.cloudflare.com/workers/examples/cron-trigger/#test-cron-triggers-using-wrangler).
+For continuous local history, schedule that request every five minutes and keep Wrangler running. Local D1 and KV state persist under `.wrangler/state`; back up that directory separately if the observed history matters.
 
-### Cloudflare deployment or local machine?
+## MCP tools
 
-| Consideration | Cloudflare deployment | Local machine |
+The server exposes 14 tools.
+
+| Tool | What it does | Important inputs |
 | --- | --- | --- |
-| Availability | Always-on remote HTTPS endpoint; best chance of uninterrupted five-minute collection. | Available only while the computer, network, and Wrangler process are running. |
-| History storage | Managed D1 plus a scheduled Worker; data lives in the deployer's Cloudflare account. | Simulated D1/KV under `.wrangler/state`; data stays on the machine but the owner must back it up. |
-| Access | Works with remote MCP clients from anywhere using the bearer key. | Loopback-only by default; remote access needs deliberate networking, TLS, and firewall work. |
-| Cost and limits | Subject to Cloudflare plan quotas and possible usage charges as history and queries grow. | No hosted Cloudflare usage, but consumes local power, disk, and uptime. Apple API limits still apply. |
-| Secret isolation | Worker secrets are managed separately from the encrypted D1 token. | `.dev.vars`, the encryption key, and encrypted database are on the same host; OS account and disk security matter. |
-| Maintenance | Cloudflare runs the process and Cron Trigger; deployments and schema migrations remain the owner's job. | The owner runs the process, scheduler, backups, updates, and recovery. |
-| Best fit | The recommended mode for durable indefinite history and remote agents. | Privacy-focused experimentation, development, or an always-on trusted home server. |
+| `apple_music_status` | Checks Apple credentials, connection, token age, and storefront. | None |
+| `apple_music_recently_played` | Pages through observed D1 history. | `preset` or `start`/`end`, `limit`, `cursor`, `refreshFirst` |
+| `apple_music_heavy_rotation` | Reads Apple Music heavy rotation. | `limit` up to 10 |
+| `apple_music_recommendations` | Reads personalized recommendation groups. | `limit` up to 10 |
+| `apple_music_replay_summary` | Reads official latest-year Replay totals and top content. | None |
+| `apple_music_list_playlists` | Lists library playlists and editability. | `limit` up to 500 |
+| `apple_music_get_playlist_tracks` | Reads tracks from a library playlist. | `playlistId`, `limit` |
+| `apple_music_search_catalog` | Searches songs, albums, artists, playlists, or music videos. | `term`, `types`, `limit` |
+| `apple_music_create_playlist` | Creates an empty library playlist. | `name`, `description` |
+| `apple_music_add_tracks_to_playlist` | Resolves, previews, deduplicates, and appends up to 100 tracks. | `playlistId`, `tracks`, `dryRun`, `allowPartial` |
+| `apple_music_analytics_refresh` | Refreshes the observed listening ledger. | `limit` up to 30 |
+| `apple_music_analytics_status` | Reports ledger coverage and recent ingest runs. | None |
+| `apple_music_listening_summary` | Returns observed totals and top categories for a timeframe. | `preset` or `start`/`end` |
+| `apple_music_top_stats` | Ranks tracks, artists, albums, or genres. | `preset` or `start`/`end`, `kind`, `limit` |
 
-Neither mode can backfill plays from before collection began. Both require internet access to Apple Music, and both are single-user per deployment.
+### Timeframe examples
 
-Useful project commands:
+Last 30 days:
+
+```json
+{
+  "preset": "30d",
+  "limit": 20
+}
+```
+
+Exact range with explicit offsets:
+
+```json
+{
+  "start": "2026-08-01T00:00:00-06:00",
+  "end": "2026-08-15T00:00:00-06:00",
+  "limit": 50
+}
+```
+
+All observed history:
+
+```json
+{
+  "preset": "all_time",
+  "limit": 50
+}
+```
+
+Presets are `today`, `24h`, `7d`, `30d`, `90d`, `ytd`, `last_year`, and `all_time`. Use either a preset or a custom inclusive `start` and optional exclusive `end`. Custom timestamps must include `Z` or a UTC offset. Calendar presets default to `America/Denver`; provide an IANA `timeZone` to override it.
+
+History pages default to 50 and are capped at 200. When `coverage.hasMore` is true, pass `nextCursor` on the next call. The cursor preserves the original timeframe so a rolling preset cannot shift between pages.
+
+### Safe playlist writes
+
+The playlist write surface is intentionally narrow:
+
+- It creates playlists and appends tracks; it does not delete, remove, reorder, or edit playlist metadata.
+- Unknown songs are matched against up to 10 catalog candidates.
+- Title, artist, and version checks reject unintended remixes, live recordings, covers, and similar variants.
+- Existing playlist tracks and duplicate request IDs are skipped.
+- One unresolved or ambiguous song blocks the batch unless `allowPartial: true` is explicitly chosen.
+- `dryRun: true` previews matching and deduplication without changing Apple Music.
+- A completed append is read back with bounded retries.
+- `pending_apple_propagation` means Apple accepted the write but its eventually consistent library read has not caught up yet.
+
+Use `dryRun: true` before large or important batches.
+
+## Listening-history limits
+
+Apple’s recently played endpoint is not a historical export. It returns at most 30 tracks and does not include play timestamps.
+
+As a result:
+
+- History cannot be backfilled.
+- `observedAt` is estimated within the polling interval.
+- More than 30 changes between polls can create a permanent gap.
+- A timeframe is not complete unless the collector covered all of it without a gap.
+- The ledger retains each observed event indefinitely, while identical raw Apple payloads are content-addressed and deduplicated.
+- `apple_music_replay_summary` is the correct source for authoritative latest-year Replay totals.
+
+## Routes and authentication
+
+| Route | Access | Purpose |
+| --- | --- | --- |
+| `/` | Public | Minimal service descriptor. |
+| `/mcp` | OAuth access token or `MCP_API_KEY` | Primary Streamable HTTP endpoint. |
+| `/sse` | `MCP_API_KEY` | Legacy endpoint name using the same MCP handler. |
+| `/authorize` | CSRF check plus `OAUTH_CONSENT_TOKEN` | Owner approval for MCP OAuth clients. |
+| `/oauth/token` | OAuth protocol | Token exchange and refresh. |
+| `/oauth/register` | OAuth protocol | Dynamic client registration. |
+| `/setup` | Short-lived session established with `SETUP_TOKEN` | Apple Music authorization page. |
+| `/auth/apple/token` | Setup session plus one-time state | Receives and encrypts the Apple music user token. |
+
+Never put access tokens, setup tokens, or OAuth tokens in a URL.
+
+## Security model
+
+- All MCP calls require OAuth or the static bearer key.
+- Cross-origin browser MCP requests are rejected unless the `Origin` matches the server origin.
+- Setup and OAuth approval use different secrets.
+- Public form and JSON bodies are type-checked and size-limited before parsing.
+- Setup sessions are HMAC-authenticated, HttpOnly, SameSite, and ten minutes long.
+- Apple setup state is hashed, session-bound, expiring, and atomically consumed.
+- Apple’s music user token is encrypted with AES-GCM before D1 storage.
+- The Apple API origin is fixed and caller-controlled path components are encoded.
+- Tool inputs, result sizes, Apple request timeouts, retries, and concurrency are bounded.
+- Audit identity comes from authenticated server context, not a caller-supplied header.
+- Audit rows are retained for `AUDIT_RETENTION_DAYS`, defaulting to 90, and purged by the scheduled handler.
+- Playlist writes are append-oriented and exclude destructive operations.
+
+This remains a single-owner system. Anyone who receives either an OAuth grant or `MCP_API_KEY` can use every exposed tool against the one connected Apple Music account.
+
+## Updating an existing deployment
+
+1. Run `npm ci`.
+2. Set the generic `MCP_API_KEY` secret to the bearer value you want clients to use.
+3. Create a new, different `OAUTH_CONSENT_TOKEN` secret.
+4. Apply all remote D1 migrations, including the audit-table migration.
+5. Deploy the Worker.
+6. Update client headers to use `MCP_API_KEY`.
+7. Open `/setup` without query parameters and reauthorize only if `apple_music_status` reports disconnected.
+
+Migration `0005_generic_audit_log.sql` preserves existing audit rows while changing the actor field to the client-neutral `client_id` name and adding the retention index.
+
+## Operations and troubleshooting
+
+### Useful commands
 
 ```bash
 npm test
 npm run typecheck
 npm run dev:local
 npm run db:migrate:local
+npx wrangler d1 migrations list apple-music-mcp --remote
 npx wrangler deploy --dry-run
 npx wrangler tail
 ```
 
-## Comparison with other Apple Music MCP servers
+### MCP returns `Unauthorized`
 
-This project is optimized for a remote agent that needs durable, queryable listening history and conservative playlist writes. Many other Apple Music MCPs optimize instead for controlling a local Music app or providing the widest possible playback and library surface.
+For static authentication, confirm the client sends exactly:
 
-The comparison below reflects the projects' published READMEs as checked on August 31, 2026; those projects may change.
-
-| Project | Architecture and Apple access | Strengths | Main tradeoff versus this project |
-| --- | --- | --- | --- |
-| **This project** | Remote Streamable HTTP on Cloudflare, or local `workerd`; Apple's documented MusicKit/Apple Music API with a user-authorized token. | Indefinite observed-event ledger, preset/custom timeframes, stable pagination, SQL analytics, official Replay, five-minute collection, encrypted token storage, and guarded create/add playlist writes. | No playback, queue, volume, rating, removal, or playlist-deletion controls; requires an Apple Developer MusicKit key. |
-| [epheterson/applemusic-mcp](https://github.com/epheterson/applemusic-mcp) | Local Python MCP with native Music.app, Apple API, Safari, and Chrome engines. | Broadest control surface of this set: playback, Up Next, ratings, folders, library management, and cross-platform browser/API modes. | More local/browser integration and a larger trust surface; its README does not describe a durable timestamped history ledger or Cloudflare-hosted remote endpoint. |
-| [kennethreitz/mcp-applemusic](https://github.com/kennethreitz/mcp-applemusic) | Local Python/FastMCP server controlling Music.app through AppleScript on macOS. | Very simple installation and direct playback/library control without Cloudflare or Apple API credentials. | macOS-only, must run beside Music.app, and does not claim remote hosting, personalized Apple API data, Replay, or persistent history analytics. |
-| [popand/AppleMusicMCP](https://github.com/popand/AppleMusicMCP) | Local Node stdio server using the documented Apple Music API and browser MusicKit authorization. | Catalog, library, recommendations, recently played, and straightforward playlist creation/addition using official API credentials. | Local client process with current recently-played results only; its README does not describe continuous collection, an indefinite ledger, custom timeframes, or SQL analytics. |
-| [akr4/applemusic-mcp-server](https://github.com/akr4/applemusic-mcp-server) | Local Rust server using an Apple developer token. | Small, focused catalog search and Apple Music deep-link generation. | Catalog-oriented only; no music-user authorization, personal library, recommendations, playlist writes, Replay, or history ledger is documented. |
-
-There are also projects that obtain web-player credentials through browser automation. They can avoid an Apple Developer membership or unlock controls absent from Apple's public API, but they rely on undocumented web behavior and token-capture flows. This project intentionally stays on Apple's documented API and MusicKit authorization surfaces.
-
-Choose this project when remote access, long-running history collection, exact timeframes, and bounded analytics matter most. Choose a local Music.app MCP when immediate playback control and zero cloud setup matter more. Choose a broader hybrid MCP when playback, queue, ratings, deletion, and cross-platform browser control outweigh the operational simplicity of a narrower API surface.
-
-## Routes
-
-| Route | Access | Purpose |
-| --- | --- | --- |
-| `/` | Public | Small JSON service descriptor. |
-| `/mcp` | `POKE_MCP_API_KEY` | Primary MCP Streamable HTTP endpoint. |
-| `/sse` | `POKE_MCP_API_KEY` | Compatibility endpoint using the same MCP handler. |
-| `/setup` | `SETUP_TOKEN` | Browser MusicKit authorization page. |
-| `/auth/apple/token` | Setup state | Receives and encrypts the authorized Apple music user token. |
-
-`/setup` accepts its token as `?setup_token=...` or as a Bearer token. MCP endpoints accept only the configured Bearer API key.
-
-## Operations and troubleshooting
-
-### Check deployment and database state
-
-```bash
-npx wrangler whoami
-npx wrangler d1 migrations list apple-music-mcp --remote
-npx wrangler secret list
+```text
+Authorization: Bearer <MCP_API_KEY>
 ```
 
-Use the MCP tools `apple_music_status` and `apple_music_analytics_status` for application-level health.
-
-`apple_music_analytics_status` reports indefinite retention, total event coverage, and the count of archived resource-payload versions. Monitor D1 storage and rows read in the Cloudflare dashboard as the all-time ledger grows. Pagination and timestamp indexes keep sequence queries bounded; summary and ranking queries aggregate in SQL.
+For OAuth, restart the client’s authorization flow if its access and refresh tokens have expired.
 
 ### Apple Music is disconnected
 
-Open the protected setup URL and authorize again. If the setup page says Apple credentials are missing, confirm that `APPLE_TEAM_ID`, `APPLE_KEY_ID`, and `APPLE_PRIVATE_KEY` exist as Worker secrets.
+Open `/setup`, enter `SETUP_TOKEN`, and authorize again. If the page reports missing Apple credentials, check:
 
-### MCP returns `Unauthorized`
-
-Confirm the client sends:
-
-```text
-Authorization: Bearer <POKE_MCP_API_KEY>
+```bash
+npx wrangler secret list
 ```
-
-The setup token does not grant MCP access, and the MCP API key does not replace the Apple account authorization.
 
 ### History is shorter than expected
 
-The collector cannot retrieve plays from before it started. Confirm the five-minute cron is deployed and call `apple_music_analytics_status` to inspect recent ingest runs. The Apple endpoint can also lose coverage if more than 30 tracks move through its window between polls.
+Call `apple_music_analytics_status`, confirm the five-minute cron is deployed, and inspect recent ingest runs. Downtime and more than 30 upstream changes between polls cannot be recovered later.
 
 ### Raw HTTP testing returns `Not Acceptable`
 
-The MCP transport expects both supported response types:
+Streamable HTTP requests must accept both supported response types:
 
 ```text
 Accept: application/json, text/event-stream
@@ -434,43 +486,44 @@ Accept: application/json, text/event-stream
 
 Normal MCP clients set this automatically.
 
-## Security notes
+### Local state reset
 
-- Apple’s `.p8` key, MCP API key, setup token, and encryption key belong in Cloudflare secrets, not `wrangler.toml`.
-- The Apple music user token is encrypted before storage with AES-GCM.
-- The setup flow uses a random state value checked by the Worker before accepting a token.
-- Read and write tool activity is recorded in `audit_log`; an optional `X-Poke-User-Id` request header is included when supplied.
-- Playlist changes are append-oriented and deliberately exclude destructive operations.
-- Losing `TOKEN_ENCRYPTION_KEY` makes the stored Apple token unreadable. Changing it requires reauthorizing Apple Music.
+Local D1, KV, authorization, and history live under `.wrangler/state`. Removing that directory resets local state. Back it up before resetting if the observed history matters.
 
 ## Project structure
 
 ```text
 src/
-  index.ts            Worker routes, MCP authentication, and scheduled handler
-  mcp.ts              MCP tool definitions and input validation
+  index.ts            Worker routes, MCP authentication, OAuth, and scheduled work
+  setup.ts            Protected browser MusicKit authorization flow
+  setup-session.ts    Short-lived signed setup-session tokens
+  http-security.ts    Body limits, cookie parsing, comparisons, and security headers
+  mcp.ts              Tool definitions, schemas, safety metadata, and write verification
   apple.ts            Apple Music API client and developer-token signing
-  analytics.ts        D1 collection, paged history queries, and SQL-side statistics
-  timeframe.ts        Preset/custom ranges and timezone-aware calendar boundaries
-  recent-history.ts   Snapshot diffing and opaque history cursor logic
-  storage.ts          Token, config, and audit persistence
-  setup.ts            Browser MusicKit authorization flow
+  apple-transport.ts  Timeouts, retry policy, and bounded concurrency
+  analytics.ts        D1 collection, history pagination, and SQL statistics
+  recent-history.ts   Snapshot diffing and history cursors
+  timeframe.ts        Preset and custom timeframes
+  song-matching.ts    Conservative catalog matching
+  storage.ts          Encrypted token, config, audit, and retention persistence
   crypto.ts           ES256 signing and AES-GCM encryption
   format.ts           Compact MCP response formatting
   types.ts            Worker and Apple API types
-migrations/           D1 schema migrations
-test/                 Snapshot, timeframe, pagination, matching, and metadata tests
-wrangler.local.toml   Local-only simulated D1/KV configuration
-wrangler.example.toml Public Worker, D1, KV, variables, and cron template
-wrangler.toml         Local deployment configuration (ignored by Git)
+migrations/           Ordered D1 schema migrations
+test/                 Functional, safety, storage, and metadata tests
+wrangler.example.toml Cloudflare deployment template
+wrangler.local.toml   Local workerd, D1, and KV configuration
 ```
 
-## Platform and API references
+## Official references
 
-- [Create an Apple Media ID and private key](https://developer.apple.com/help/account/capabilities/create-a-media-identifier-and-private-key/)
-- [Create an Apple service private key](https://developer.apple.com/help/account/keys/create-a-private-key)
-- [Apple Music API: recently played tracks](https://developer.apple.com/documentation/applemusicapi/get-v1-me-recent-played-tracks)
-- [Cloudflare D1 getting started](https://developers.cloudflare.com/d1/get-started/)
-- [Cloudflare D1 migrations](https://developers.cloudflare.com/d1/reference/migrations/)
-- [Cloudflare Worker secrets](https://developers.cloudflare.com/workers/configuration/secrets/)
-- [Cloudflare Cron Triggers](https://developers.cloudflare.com/workers/configuration/cron-triggers/)
+- [Apple: create a media identifier and private key](https://developer.apple.com/help/account/capabilities/create-a-media-identifier-and-private-key/)
+- [Apple: create and download a private key](https://developer.apple.com/help/account/keys/create-a-private-key/)
+- [Apple: generate developer tokens](https://developer.apple.com/documentation/applemusicapi/generating-developer-tokens)
+- [Cloudflare: D1 getting started](https://developers.cloudflare.com/d1/get-started/)
+- [Cloudflare: D1 migrations](https://developers.cloudflare.com/d1/reference/migrations/)
+- [Cloudflare: KV Wrangler commands](https://developers.cloudflare.com/workers/wrangler/commands/kv/)
+- [Cloudflare: Worker secrets](https://developers.cloudflare.com/workers/configuration/secrets/)
+- [Cloudflare: Cron Triggers](https://developers.cloudflare.com/workers/configuration/cron-triggers/)
+- [MCP: Streamable HTTP transport](https://modelcontextprotocol.io/specification/2025-06-18/basic/transports)
+- [MCP: HTTP authorization](https://modelcontextprotocol.io/specification/2025-06-18/basic/authorization)

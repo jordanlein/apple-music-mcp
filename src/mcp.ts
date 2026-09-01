@@ -58,7 +58,7 @@ const REFRESH_BACKEND = {
 
 export function createAppleMusicMcp(ctx: ToolContext): McpServer {
   const server = new McpServer({
-    name: "apple-music",
+    name: "apple-music-mcp",
     version: "0.1.0"
   });
 
@@ -75,12 +75,17 @@ export function createAppleMusicMcp(ctx: ToolContext): McpServer {
       const token = await appleTokenStatus(ctx.env);
       let storefront: string | undefined;
       if (token.connected) storefront = await api.userStorefront();
-      return jsonText({
+      const result = {
         appleCredentialsConfigured: hasAppleCredentials(ctx.env),
         connected: token.connected,
         tokenUpdatedAt: token.updatedAt,
         storefront
+      };
+      await audit(ctx.env, ctx.clientId, "apple_music_status", "read", {
+        appleCredentialsConfigured: result.appleCredentialsConfigured,
+        connected: result.connected
       });
+      return jsonText(result);
     }
   );
 
@@ -92,7 +97,7 @@ export function createAppleMusicMcp(ctx: ToolContext): McpServer {
       annotations: REFRESHING_READ,
       inputSchema: {
         ...TIMEFRAME_INPUT_SCHEMA,
-        limit: z.number().int().min(1).max(200).default(50).describe("Maximum songs in this page, from 1 to 200. Keep this small for agent efficiency."),
+        limit: z.number().int().min(1).max(200).default(50).describe("Maximum songs in this page, from 1 to 200. Keep this small for client efficiency."),
         cursor: z.string().max(1024).optional().describe("Opaque nextCursor from the previous page. It preserves the original range, so other timeframe fields may be omitted while paging."),
         refreshFirst: z.boolean().default(true).describe("Refresh the 30-track Apple window before querying Cloudflare history.")
       }
@@ -100,7 +105,7 @@ export function createAppleMusicMcp(ctx: ToolContext): McpServer {
     async ({ preset, start, end, timeZone, limit, cursor, refreshFirst }) => {
       if (refreshFirst) await refreshRecentListeningAnalytics(ctx.env);
       const result = await recentListeningHistory(ctx.env, { preset, start, end, timeZone, limit, cursor });
-      await audit(ctx.env, ctx.pokeUserId, "apple_music_recently_played", "read", {
+      await audit(ctx.env, ctx.clientId, "apple_music_recently_played", "read", {
         preset,
         start,
         end,
@@ -127,7 +132,7 @@ export function createAppleMusicMcp(ctx: ToolContext): McpServer {
     async ({ limit }) => {
       const api = new AppleMusicApi(ctx.env);
       const items = await api.heavyRotation(limit);
-      await audit(ctx.env, ctx.pokeUserId, "apple_music_heavy_rotation", "read", { limit, count: items.length });
+      await audit(ctx.env, ctx.clientId, "apple_music_heavy_rotation", "read", { limit, count: items.length });
       return jsonText({ items: compactResources(items) });
     }
   );
@@ -145,7 +150,7 @@ export function createAppleMusicMcp(ctx: ToolContext): McpServer {
     async ({ limit }) => {
       const api = new AppleMusicApi(ctx.env);
       const items = await api.recommendations(limit);
-      await audit(ctx.env, ctx.pokeUserId, "apple_music_recommendations", "read", { limit, count: items.length });
+      await audit(ctx.env, ctx.clientId, "apple_music_recommendations", "read", { limit, count: items.length });
       return jsonText({ items: compactResources(items) });
     }
   );
@@ -160,7 +165,7 @@ export function createAppleMusicMcp(ctx: ToolContext): McpServer {
     },
     async () => {
       const result = await appleReplaySummary(ctx.env);
-      await audit(ctx.env, ctx.pokeUserId, "apple_music_replay_summary", "read", { year: result.coverage.year, period: result.coverage.period });
+      await audit(ctx.env, ctx.clientId, "apple_music_replay_summary", "read", { year: result.coverage.year, period: result.coverage.period });
       return jsonText(result);
     }
   );
@@ -178,7 +183,7 @@ export function createAppleMusicMcp(ctx: ToolContext): McpServer {
     async ({ limit }) => {
       const api = new AppleMusicApi(ctx.env);
       const playlists = await api.listPlaylists(limit);
-      await audit(ctx.env, ctx.pokeUserId, "apple_music_list_playlists", "read", { limit, count: playlists.length });
+      await audit(ctx.env, ctx.clientId, "apple_music_list_playlists", "read", { limit, count: playlists.length });
       return jsonText({ playlists: compactResources(playlists) });
     }
   );
@@ -190,14 +195,14 @@ export function createAppleMusicMcp(ctx: ToolContext): McpServer {
       description: "Use to inspect an Apple Music library playlist, verify an append, or see which tracks it already contains. Pass the library playlist ID returned by apple_music_list_playlists or apple_music_create_playlist, usually beginning with 'p.'. An empty playlist returns an empty tracks array.",
       annotations: READ_ONLY_APPLE,
       inputSchema: {
-        playlistId: z.string().min(1).describe("Apple Music library playlist ID, usually beginning with p."),
+        playlistId: z.string().min(1).max(256).describe("Apple Music library playlist ID, usually beginning with p."),
         limit: z.number().int().min(1).max(500).default(100).describe("Maximum playlist tracks to return, from 1 to 500.")
       }
     },
     async ({ playlistId, limit }) => {
       const api = new AppleMusicApi(ctx.env);
       const tracks = await api.playlistTracks(playlistId, limit);
-      await audit(ctx.env, ctx.pokeUserId, "apple_music_get_playlist_tracks", "read", { playlistId, limit, count: tracks.length });
+      await audit(ctx.env, ctx.clientId, "apple_music_get_playlist_tracks", "read", { playlistId, limit, count: tracks.length });
       return jsonText({ playlistId, tracks: compactResources(tracks) });
     }
   );
@@ -209,7 +214,7 @@ export function createAppleMusicMcp(ctx: ToolContext): McpServer {
       description: "Use to browse or disambiguate songs, albums, artists, playlists, or music videos in the connected user's storefront and retrieve canonical catalog IDs. This searches the Apple Music catalog, not only the user's library. For adding many songs to a library playlist, do not call this once per song: pass the entire batch of IDs, search terms, or name/artist pairs directly to apple_music_add_tracks_to_playlist, which resolves unknown songs itself.",
       annotations: READ_ONLY_APPLE,
       inputSchema: {
-        term: z.string().min(1).describe("Catalog search text. Include both title and artist when looking for a specific song."),
+        term: z.string().min(1).max(200).describe("Catalog search text, up to 200 characters. Include both title and artist when looking for a specific song."),
         types: z.enum(["songs", "albums", "artists", "playlists", "music-videos"]).default("songs").describe("Single catalog resource type to search. Defaults to songs."),
         limit: z.number().int().min(1).max(25).default(10).describe("Maximum matches to return, from 1 to Apple's per-search maximum of 25.")
       }
@@ -217,7 +222,7 @@ export function createAppleMusicMcp(ctx: ToolContext): McpServer {
     async ({ term, types, limit }) => {
       const api = new AppleMusicApi(ctx.env);
       const results = await api.searchCatalog(term, types, limit);
-      await audit(ctx.env, ctx.pokeUserId, "apple_music_search_catalog", "read", { term, types, limit });
+      await audit(ctx.env, ctx.clientId, "apple_music_search_catalog", "read", { term, types, limit });
       return jsonText(Object.fromEntries(Object.entries(results).map(([key, values]) => [key, compactResources(values)])));
     }
   );
@@ -236,7 +241,7 @@ export function createAppleMusicMcp(ctx: ToolContext): McpServer {
     async ({ name, description }) => {
       const api = new AppleMusicApi(ctx.env);
       const playlist = await api.createPlaylist(name, description);
-      await audit(ctx.env, ctx.pokeUserId, "apple_music_create_playlist", "write", { name, playlistId: playlist?.id });
+      await audit(ctx.env, ctx.clientId, "apple_music_create_playlist", "write", { name, playlistId: playlist?.id });
       return jsonText({ playlist: playlist ? compactResource(playlist) : null });
     }
   );
@@ -248,12 +253,12 @@ export function createAppleMusicMcp(ctx: ToolContext): McpServer {
       description: "Use to safely append 1 to 100 songs to an existing editable Apple Music library playlist. Prefer one call containing the complete batch and provide separate name and artist fields for every song without a known catalog ID. The resolver compares up to 10 candidates per song, requires a strong title/artist/version match, rejects unintended remixes, live recordings, covers, and other variants, checks both existing playlist contents and duplicates within the request, and reports unresolved or ambiguous songs with candidate details. By default the write is atomic at the resolution stage: if any song is unresolved or ambiguous, nothing is added. Run dryRun=true first for important or large playlists, inspect every proposed match, then repeat with dryRun=false. Set allowPartial=true only when the user explicitly accepts skipping questionable songs. After Apple accepts a write, the tool retries playlist readback; verificationStatus=pending_apple_propagation means the library has not reflected the change yet, not that the append failed. Apple’s public API cannot remove or reorder playlist tracks, so prevention and preflight verification are essential.",
       annotations: ADD_TO_APPLE_RESOURCE,
       inputSchema: {
-        playlistId: z.string().min(1).describe("Apple Music library playlist ID, usually beginning with p."),
+        playlistId: z.string().min(1).max(256).describe("Apple Music library playlist ID, usually beginning with p."),
         tracks: z.array(z.object({
-          id: z.string().optional().describe("Apple Music catalog song ID. Prefer this when known."),
-          term: z.string().optional().describe("Fallback search phrase used when ID is unknown. For reliable matching, also provide separate name and artist fields."),
-          name: z.string().optional().describe("Exact requested song title, including a version label such as Remix or Live only when that version is intended."),
-          artist: z.string().optional().describe("Expected primary song artist. Strongly recommended whenever ID is unknown; mismatched artists are rejected.")
+          id: z.string().max(256).optional().describe("Apple Music catalog song ID. Prefer this when known."),
+          term: z.string().max(200).optional().describe("Fallback search phrase used when ID is unknown. For reliable matching, also provide separate name and artist fields."),
+          name: z.string().max(200).optional().describe("Exact requested song title, including a version label such as Remix or Live only when that version is intended."),
+          artist: z.string().max(200).optional().describe("Expected primary song artist. Strongly recommended whenever ID is unknown; mismatched artists are rejected.")
         }).refine((track) => Boolean(track.id || track.term || track.name), {
           message: "Each track needs an id, term, or name."
         })).min(1).max(100).describe("Complete batch of 1 to 100 songs to resolve, deduplicate, and append in this call."),
@@ -293,7 +298,7 @@ export function createAppleMusicMcp(ctx: ToolContext): McpServer {
         : undefined;
       const verifiedAdded = added.filter((track) => verification?.observedIds.has(track.id));
       const pendingVerification = added.filter((track) => !verification?.observedIds.has(track.id));
-      await audit(ctx.env, ctx.pokeUserId, "apple_music_add_tracks_to_playlist", dryRun ? "preview_write" : blocked ? "blocked_write" : "write", {
+      await audit(ctx.env, ctx.clientId, "apple_music_add_tracks_to_playlist", dryRun ? "preview_write" : blocked ? "blocked_write" : "write", {
         playlistId,
         requested: tracks.length,
         resolved: resolution.resolved.length,
@@ -344,7 +349,7 @@ export function createAppleMusicMcp(ctx: ToolContext): McpServer {
     },
     async ({ limit }) => {
       const result = await refreshRecentListeningAnalytics(ctx.env, { limit });
-      await audit(ctx.env, ctx.pokeUserId, "apple_music_analytics_refresh", "write", result);
+      await audit(ctx.env, ctx.clientId, "apple_music_analytics_refresh", "write", result);
       return jsonText(result);
     }
   );
@@ -359,6 +364,10 @@ export function createAppleMusicMcp(ctx: ToolContext): McpServer {
     },
     async () => {
       const result = await analyticsStatus(ctx.env);
+      await audit(ctx.env, ctx.clientId, "apple_music_analytics_status", "read", {
+        listenEvents: result.listenEvents,
+        archivedResourceVersions: result.archivedResourceVersions
+      });
       return jsonText(result);
     }
   );
@@ -367,7 +376,7 @@ export function createAppleMusicMcp(ctx: ToolContext): McpServer {
     "apple_music_listening_summary",
     {
       title: "Summarize Observed Listening",
-      description: "Use for a Stats.fm/Airbuds-style overview of observed listening during any preset or exact custom timeframe. Returns SQL-computed estimated plays and listening minutes, unique counts, top tracks/artists/albums/genres, recent tracks, and explicit coverage metadata without loading the full history into the agent or Worker. The ledger is retained indefinitely but begins when the collector first observed plays; use apple_music_replay_summary for official year-level totals, apple_music_recently_played for a paged track sequence, or apple_music_top_stats for one ranked category.",
+      description: "Use for a Stats.fm/Airbuds-style overview of observed listening during any preset or exact custom timeframe. Returns SQL-computed estimated plays and listening minutes, unique counts, top tracks/artists/albums/genres, recent tracks, and explicit coverage metadata without loading the full history into the client or Worker. The ledger is retained indefinitely but begins when the collector first observed plays; use apple_music_replay_summary for official year-level totals, apple_music_recently_played for a paged track sequence, or apple_music_top_stats for one ranked category.",
       annotations: REFRESHING_READ,
       inputSchema: {
         ...TIMEFRAME_INPUT_SCHEMA,
@@ -378,7 +387,7 @@ export function createAppleMusicMcp(ctx: ToolContext): McpServer {
       if (refreshFirst) await refreshRecentListeningAnalytics(ctx.env);
       const timeframe = { preset, start, end, timeZone };
       const result = await listeningSummary(ctx.env, timeframe);
-      await audit(ctx.env, ctx.pokeUserId, "apple_music_listening_summary", "read", { ...timeframe, refreshFirst });
+      await audit(ctx.env, ctx.clientId, "apple_music_listening_summary", "read", { ...timeframe, refreshFirst });
       return jsonText(result);
     }
   );
@@ -387,7 +396,7 @@ export function createAppleMusicMcp(ctx: ToolContext): McpServer {
     "apple_music_top_stats",
     {
       title: "Rank Observed Listening Stats",
-      description: "Use when the user asks for one ranked observed category—top tracks, artists, albums, or genres—during any preset or exact custom timeframe. D1 performs the aggregation and returns only the requested ranking plus coverage metadata, making even all-time questions efficient for the agent. These are collector observations, not authoritative year-level totals; use apple_music_replay_summary for official Replay or apple_music_listening_summary for a multi-category overview.",
+      description: "Use when the user asks for one ranked observed category—top tracks, artists, albums, or genres—during any preset or exact custom timeframe. D1 performs the aggregation and returns only the requested ranking plus coverage metadata, making even all-time questions efficient for the client. These are collector observations, not authoritative year-level totals; use apple_music_replay_summary for official Replay or apple_music_listening_summary for a multi-category overview.",
       annotations: REFRESHING_READ,
       inputSchema: {
         ...TIMEFRAME_INPUT_SCHEMA,
@@ -400,7 +409,7 @@ export function createAppleMusicMcp(ctx: ToolContext): McpServer {
       if (refreshFirst) await refreshRecentListeningAnalytics(ctx.env);
       const timeframe = { preset, start, end, timeZone };
       const result = await topListeningStats(ctx.env, timeframe, kind, limit);
-      await audit(ctx.env, ctx.pokeUserId, "apple_music_top_stats", "read", { ...timeframe, kind, limit, refreshFirst });
+      await audit(ctx.env, ctx.clientId, "apple_music_top_stats", "read", { ...timeframe, kind, limit, refreshFirst });
       return jsonText(result);
     }
   );
