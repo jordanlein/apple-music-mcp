@@ -1,5 +1,6 @@
 import { AppleMusicApi } from "./apple";
 import { compactResource } from "./format";
+import { classifyCollectorError } from "./collector-diagnostics";
 import {
   decodeHistoryCursor,
   diffRecentSnapshots,
@@ -17,10 +18,40 @@ const HISTORY_DEFAULT_LIMIT = 50;
 const HISTORY_MAX_LIMIT = 200;
 const RESOURCE_ARCHIVE_CHUNK_SIZE = 20;
 
-export async function refreshRecentListeningAnalytics(env: Env, options: { limit?: number } = {}): Promise<AnalyticsRefreshResult> {
+export async function refreshRecentListeningAnalytics(
+  env: Env,
+  options: { limit?: number; trigger?: "scheduled" | "mcp" } = {}
+): Promise<AnalyticsRefreshResult> {
+  const runId = crypto.randomUUID();
   const startedAt = new Date().toISOString();
+  try {
+    await env.DB.prepare(
+      "INSERT INTO collector_runs (id, trigger_source, status, started_at) VALUES (?, ?, 'running', ?)"
+    ).bind(runId, options.trigger ?? "mcp", startedAt).run();
+    return await collectRecentListening(env, runId, startedAt);
+  } catch (error) {
+    const diagnostic = classifyCollectorError(error);
+    try {
+      await env.DB.prepare(
+        "UPDATE collector_runs SET status = 'failed', finished_at = ?, error_kind = ?, apple_http_status = ? WHERE id = ?"
+      ).bind(new Date().toISOString(), diagnostic.errorKind, diagnostic.appleHttpStatus, runId).run();
+    } catch {
+      console.error(JSON.stringify({ event: "collector_diagnostics_write_failed", runId }));
+    }
+    console.error(JSON.stringify({ event: "collector_failed", runId, ...diagnostic }));
+    throw error;
+  }
+}
+
+async function collectRecentListening(
+  env: Env,
+  runId: string,
+  startedAt: string
+): Promise<AnalyticsRefreshResult> {
   const api = new AppleMusicApi(env);
-  const limit = Math.max(1, Math.min(options.limit ?? RECENTLY_PLAYED_LIMIT, RECENTLY_PLAYED_LIMIT));
+  // Snapshot reconciliation must always compare the complete available window.
+  // A client's display limit must not shrink the saved collector snapshot.
+  const limit = RECENTLY_PLAYED_LIMIT;
   const resources = await api.recentlyPlayed(limit);
   const [snapshotValue, previousCursor] = await Promise.all([
     getAnalyticsState(env, RECENT_SNAPSHOT_STATE_KEY),
@@ -34,6 +65,15 @@ export async function refreshRecentListeningAnalytics(env: Env, options: { limit
   const observedTimes = estimateObservedTimes(newlyObserved.length, startedAt, storedSnapshot?.capturedAt);
   const transitionId = await snapshotTransitionId(storedSnapshot?.capturedAt, previousFingerprints, fingerprints);
   const latestKey = fingerprints[0];
+  const previousPollAt = storedSnapshot?.capturedAt ?? null;
+  const pollIntervalMs = previousPollAt && Number.isFinite(Date.parse(previousPollAt))
+    ? Math.max(0, Date.parse(startedAt) - Date.parse(previousPollAt))
+    : null;
+  await env.DB.prepare(
+    `UPDATE collector_runs SET previous_poll_at = ?, poll_interval_ms = ?, fetched_count = ?,
+     inferred_new_count = ?, overlap_count = ?, initial_snapshot = ?, gap_detected = ? WHERE id = ?`
+  ).bind(previousPollAt, pollIntervalMs, resources.length, diff.newCount, diff.overlapCount,
+    Number(diff.initialSnapshot), Number(diff.gapDetected), runId).run();
   let inserted = 0;
   let skipped = 0;
 
@@ -86,23 +126,16 @@ export async function refreshRecentListeningAnalytics(env: Env, options: { limit
         resourcesWithTimes[index]?.resourceHash ?? null
       );
   });
-  if (insertStatements.length) {
-    const results = await env.DB.batch([...resourceStatements, ...insertStatements]);
-    for (const result of results.slice(resourceStatements.length)) {
-      if (result.meta.changes > 0) inserted += 1;
-      else skipped += 1;
-    }
-  }
-
   const stateStatements = [
-    env.DB.prepare(
-      "INSERT INTO analytics_state (key, value, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = CURRENT_TIMESTAMP"
-    ).bind(RECENT_SNAPSHOT_STATE_KEY, JSON.stringify({ capturedAt: startedAt, fingerprints })),
-    env.DB.prepare(
-      "INSERT INTO analytics_ingest_runs (source, fetched_count, inserted_count, skipped_count, started_at) VALUES ('recently_played', ?, ?, ?, ?)"
-    ).bind(resources.length, inserted, skipped, startedAt),
     env.DB.prepare("DELETE FROM analytics_ingest_runs WHERE started_at < datetime('now', '-30 days')")
   ];
+  // An unexpectedly empty response must not erase the preceding nonempty
+  // snapshot and turn its entire returning window into apparent new plays.
+  if (resources.length || !previousFingerprints.length) {
+    stateStatements.push(env.DB.prepare(
+      "INSERT INTO analytics_state (key, value, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = CURRENT_TIMESTAMP"
+    ).bind(RECENT_SNAPSHOT_STATE_KEY, JSON.stringify({ capturedAt: startedAt, fingerprints })));
+  }
   if (latestKey) {
     stateStatements.push(
       env.DB.prepare(
@@ -110,13 +143,29 @@ export async function refreshRecentListeningAnalytics(env: Env, options: { limit
       ).bind("recent_cursor_event_key", latestKey)
     );
   }
-  await env.DB.batch(stateStatements);
+  // D1 batch is transactional: do not advance the snapshot if any event or
+  // payload insert fails. That allows the next poll to retry the same window.
+  const results = await env.DB.batch([...resourceStatements, ...insertStatements, ...stateStatements]);
+  for (const result of results.slice(resourceStatements.length, resourceStatements.length + insertStatements.length)) {
+    if (result.meta.changes > 0) inserted += 1;
+    else skipped += 1;
+  }
+  await env.DB.batch([
+    env.DB.prepare(
+      "INSERT INTO analytics_ingest_runs (source, fetched_count, inserted_count, skipped_count, started_at) VALUES ('recently_played', ?, ?, ?, ?)"
+    ).bind(resources.length, inserted, skipped, startedAt),
+    env.DB.prepare(
+      "UPDATE collector_runs SET status = 'succeeded', finished_at = ?, inserted_count = ?, duplicate_event_count = ? WHERE id = ?"
+    ).bind(new Date().toISOString(), inserted, skipped, runId)
+  ]);
 
   return {
     source: "recently_played",
     fetched: resources.length,
     inserted,
     skipped,
+    duplicateEvents: skipped,
+    runId,
     startedAt,
     latestCursorUpdated: Boolean(latestKey),
     inferredNewItems: diff.newCount,
@@ -298,7 +347,9 @@ export async function analyticsStatus(env: Env): Promise<AnalyticsStatus> {
     env.DB.prepare("SELECT observed_at FROM listen_events ORDER BY observed_at DESC, id DESC LIMIT 1"),
     env.DB.prepare("SELECT source, fetched_count, inserted_count, skipped_count, started_at, finished_at FROM analytics_ingest_runs ORDER BY id DESC LIMIT 5"),
     env.DB.prepare("SELECT value FROM analytics_state WHERE key = 'recent_cursor_event_key'"),
-    env.DB.prepare("SELECT COUNT(*) AS count FROM track_resource_versions")
+    env.DB.prepare("SELECT COUNT(*) AS count FROM track_resource_versions"),
+    env.DB.prepare("SELECT * FROM collector_runs ORDER BY started_at DESC LIMIT 20"),
+    env.DB.prepare("SELECT started_at FROM collector_runs WHERE status = 'succeeded' ORDER BY started_at DESC LIMIT 1")
   ]);
   const countRow = results[0]?.results?.[0] as { count?: number } | undefined;
   const firstRow = results[1]?.results?.[0] as { observed_at?: string } | undefined;
@@ -313,7 +364,15 @@ export async function analyticsStatus(env: Env): Promise<AnalyticsStatus> {
     firstObservedAt: firstRow?.observed_at,
     lastObservedAt: lastRow?.observed_at,
     hasRecentCursor: Boolean(cursor?.value),
-    recentIngestRuns: runRows
+    recentIngestRuns: runRows,
+    recentCollectorRuns: results[6]?.results ?? [],
+    collector: {
+      expectedPollIntervalMs: 300_000,
+      lastSuccessfulPollAt: results[7]?.results?.[0]?.started_at,
+      timestampsAreEstimated: true,
+      skippedCountMeaning: "Duplicate database events, not skipped songs.",
+      note: "Legacy ingest runs record successful polls only. Missing polls and gaps between song observations do not prove listening activity or lost songs. A full window without overlap flags possible lost coverage; it does not count missing tracks."
+    }
   };
 }
 
@@ -369,6 +428,8 @@ interface AnalyticsRefreshResult {
   fetched: number;
   inserted: number;
   skipped: number;
+  duplicateEvents: number;
+  runId: string;
   startedAt: string;
   latestCursorUpdated: boolean;
   inferredNewItems: number;
@@ -462,6 +523,14 @@ interface AnalyticsStatus {
   lastObservedAt?: string;
   hasRecentCursor: boolean;
   recentIngestRuns: IngestRunRow[];
+  recentCollectorRuns: Record<string, unknown>[];
+  collector: {
+    expectedPollIntervalMs: number;
+    lastSuccessfulPollAt?: unknown;
+    timestampsAreEstimated: boolean;
+    skippedCountMeaning: string;
+    note: string;
+  };
 }
 
 interface RankedItem {
@@ -606,7 +675,8 @@ function rowToTrack(row: ListenEventRow): Record<string, unknown> {
     durationInMillis: row.duration_ms,
     artworkUrl: row.artwork_url,
     url: row.apple_url,
-    observedAt: row.observed_at
+    observedAt: row.observed_at,
+    timestampKind: "estimated_from_polling"
   };
 }
 
@@ -674,7 +744,7 @@ async function sha256Hex(value: string): Promise<string> {
 }
 
 function coverageNote(): string {
-  return "Apple exposes only the latest 30 tracks and no play timestamps. The Cloudflare collector keeps every newly observed event indefinitely; observedAt is estimated within the polling interval, collection cannot backfill time before it started, and gaps are possible if more than 30 tracks change between polls.";
+  return "This collector reads a 30-track Apple recently played window without actual play timestamps. It keeps every newly observed event indefinitely; observedAt is synthesized from polling intervals and must not be used to infer individual song skips. Initial snapshots have no known play-time bounds. Collection cannot backfill earlier activity, and a replaced window can lose coverage.";
 }
 
 function summaryCoverageNote(): string {

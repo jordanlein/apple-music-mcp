@@ -341,10 +341,10 @@ export function createAppleMusicMcp(ctx: ToolContext): McpServer {
     "apple_music_analytics_refresh",
     {
       title: "Refresh Listening Analytics",
-      description: "Use only to force a maintenance refresh of the Cloudflare observed listening ledger or diagnose ingestion. Normally do not call this directly: apple_music_recently_played, apple_music_listening_summary, and apple_music_top_stats refresh automatically by default. Fetches Apple's current recently-played window of at most 30 tracks, compares it with the prior snapshot, and stores newly observed events. It cannot backfill older history and never modifies the Apple Music library.",
+      description: "Use only to force a maintenance refresh of the observed listening ledger or diagnose ingestion. Normally do not call this directly: apple_music_recently_played, apple_music_listening_summary, and apple_music_top_stats refresh automatically by default. Fetches Apple's full current recently-played window of at most 30 tracks, compares it with the prior snapshot, and stores newly observed events. It cannot backfill older history and never modifies the Apple Music library.",
       annotations: REFRESH_BACKEND,
       inputSchema: {
-        limit: z.number().int().min(1).max(30).default(30).describe("Number of tracks to request from Apple's current recently-played window, from 1 to the maximum of 30.")
+        limit: z.number().int().min(1).max(30).default(30).describe("Legacy parameter accepted for compatibility. Collection always compares the full 30-track window to preserve the snapshot.")
       }
     },
     async ({ limit }) => {
@@ -358,7 +358,7 @@ export function createAppleMusicMcp(ctx: ToolContext): McpServer {
     "apple_music_analytics_status",
     {
       title: "Check Analytics Coverage",
-      description: "Use when observed listening results look incomplete or stale, or when diagnosing the collector. Reports stored event count, first and last observed timestamps, cursor state, and recent ingestion runs. This reads backend coverage metadata only and does not refresh Apple Music or modify the library.",
+      description: "Use when observed listening results look incomplete or stale, or when diagnosing the collector. Reports stored event count, first and last estimated observations, cursor state, successful legacy ingestion runs, and durable poll attempts with failures, overlap, and possible coverage loss. Gaps between track observations do not establish polling gaps; skipped_count means duplicate events, not skipped songs. This reads backend metadata only and does not refresh Apple Music or modify the library.",
       annotations: READ_ONLY_BACKEND,
       inputSchema: {}
     },

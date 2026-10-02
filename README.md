@@ -1,5 +1,12 @@
 # Apple Music MCP on Cloudflare
 
+Collector diagnostics and the prepared Sites entrypoint are described in
+[Sites migration](docs/sites-migration.md). Sites supports MCP hosting; the
+destination's data import, secrets and five-minute collection schedule must be
+verified before switching away from the current deployment.
+
+For an existing Mac checkout, follow the [Mac update and migration handoff](docs/mac-handoff.md).
+
 Connect Apple Music to any MCP client that supports remote Streamable HTTP servers.
 
 This self-hosted server runs on Cloudflare Workers, keeps its state in your own D1 database, and uses Apple’s documented MusicKit and Apple Music API surfaces. One deployment connects to one Apple Music account.
