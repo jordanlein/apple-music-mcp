@@ -6,3 +6,7 @@ outputs/
 wrangler.toml
 .DS_Store
 *.log
+
+# Keep signing keys and account-specific hosting configuration local.
+*.p8
+.openai/hosting.json

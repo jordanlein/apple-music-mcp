@@ -2,8 +2,6 @@ import type { OAuthHelpers } from "@cloudflare/workers-oauth-provider";
 
 export interface Env {
   DB: D1Database;
-  OAUTH_KV: KVNamespace;
-  OAUTH_PROVIDER: OAuthHelpers;
   APPLE_TEAM_ID: string;
   APPLE_KEY_ID: string;
   APPLE_PRIVATE_KEY: string;
@@ -14,6 +12,11 @@ export interface Env {
   SETUP_TOKEN: string;
   OAUTH_CONSENT_TOKEN: string;
   AUDIT_RETENTION_DAYS?: string;
+}
+
+export interface CloudflareEnv extends Env {
+  OAUTH_KV: KVNamespace;
+  OAUTH_PROVIDER: OAuthHelpers;
 }
 
 export interface AppleTokenSet {
