@@ -21,7 +21,7 @@ const { AppleMusicApi } = await import("../src/apple.ts");
 
 function database() {
   const sqlite = new DatabaseSync(":memory:");
-  for (const migration of ["0001_init", "0002_listening_analytics", "0003_indefinite_history", "0004_resource_versions", "0005_generic_audit_log", "0006_collector_diagnostics"]) {
+  for (const migration of ["0001_init", "0002_listening_analytics", "0003_indefinite_history", "0004_resource_versions", "0005_generic_audit_log", "0006_collector_diagnostics", "0007_collector_control"]) {
     sqlite.exec(readFileSync(new URL(`../migrations/${migration}.sql`, import.meta.url), "utf8"));
   }
   let failEventInsert = false;
@@ -128,4 +128,84 @@ test("a failed event write rolls back payloads and snapshot advancement", async 
     assert.equal(db.sqlite.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get()!.n, 0);
   }
   assert.equal(db.sqlite.prepare("SELECT status FROM collector_runs").get()!.status, "failed");
+});
+
+test('concurrent scheduled and MCP requests share one durable collection lease', async (t) => {
+  const {sqlite, env} = database(); t.after(() => sqlite.close());
+  let finish!: (value: any[]) => void;
+  let called!: () => void;
+  const started = new Promise<void>(resolve => { called = resolve; });
+  let calls = 0;
+  t.mock.method(AppleMusicApi.prototype, 'recentlyPlayed', async () => {
+    calls++; called(); return new Promise<any[]>(resolve => { finish = resolve; });
+  });
+  const first = refreshRecentListeningAnalytics(env, {trigger: 'scheduled'});
+  await started;
+  const second = await refreshRecentListeningAnalytics(env, {trigger: 'mcp'});
+  assert.equal(second.deferred, 'busy');
+  assert.equal(calls, 1);
+  finish(tracks('a', 3));
+  assert.equal((await first).inserted, 3);
+  assert.equal(sqlite.prepare('SELECT COUNT(*) AS n FROM collector_runs').get()!.n, 1);
+  assert.equal(sqlite.prepare("SELECT lease_until_ms FROM collector_control WHERE name='recently_played'").get()!.lease_until_ms, 0);
+});
+
+test('Apple 429 persists its complete cooldown across requests without advancing the snapshot', async (t) => {
+  const {sqlite, env} = database(); t.after(() => sqlite.close());
+  const {AppleMusicApiError} = await import('../src/apple-transport.ts');
+  let calls = 0;
+  t.mock.method(AppleMusicApi.prototype, 'recentlyPlayed', async () => { calls++; throw new AppleMusicApiError(429, 'private body', '900'); });
+  const before = Date.now();
+  await assert.rejects(refreshRecentListeningAnalytics(env), /429/);
+  const row = sqlite.prepare("SELECT * FROM collector_control WHERE name='recently_played'").get()!;
+  assert.ok(Number(row.cooldown_until_ms) >= before + 900_000);
+  assert.equal((await refreshRecentListeningAnalytics(env)).deferred, 'cooldown');
+  assert.equal(calls, 1);
+  const status = await analyticsStatus({...env, COLLECTOR_POLL_INTERVAL_SECONDS: '120'});
+  assert.equal(status.collector.expectedPollIntervalMs, 120_000);
+  assert.ok(status.collector.cooldownUntil);
+  assert.equal(status.collector.collectionInProgress, false);
+  assert.equal(sqlite.prepare('SELECT COUNT(*) AS n FROM analytics_state').get()!.n, 0);
+  assert.equal(sqlite.prepare('SELECT apple_http_status FROM collector_runs').get()!.apple_http_status, 429);
+});
+
+test('an expired writer cannot commit after a successor takes the lease or release its lease', async (t) => {
+  const {sqlite, env} = database(); t.after(() => sqlite.close());
+  t.mock.method(AppleMusicApi.prototype, 'recentlyPlayed', async () => {
+    sqlite.prepare("UPDATE collector_control SET owner='successor', lease_until_ms=? WHERE name='recently_played'").run(Date.now()+180_000);
+    return tracks('stale', 3);
+  });
+  await assert.rejects(refreshRecentListeningAnalytics(env), /CHECK constraint failed/);
+  for (const table of ['listen_events', 'track_resource_versions', 'analytics_state']) {
+    assert.equal(sqlite.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get()!.n, 0);
+  }
+  assert.equal(sqlite.prepare("SELECT owner FROM collector_control WHERE name='recently_played'").get()!.owner, 'successor');
+});
+
+test('leases recover after crashes and standalone KV maintenance is claimed only once an hour', async (t) => {
+  const {sqlite, env} = database(); t.after(() => sqlite.close());
+  const {acquireLease, claimScheduledMaintenance, recordRateLimitCooldown, COLLECTION_CONTROL} = await import('../src/collector-control.ts');
+  const now = Date.now();
+  assert.equal((await acquireLease(env.DB, COLLECTION_CONTROL, 'old', now)).acquired, true);
+  assert.equal((await acquireLease(env.DB, COLLECTION_CONTROL, 'other', now + 10)).acquired, false);
+  assert.equal((await acquireLease(env.DB, COLLECTION_CONTROL, 'new', now + 180_000)).acquired, true);
+  await recordRateLimitCooldown(env.DB, 300_000, now);
+  assert.equal((await acquireLease(env.DB, COLLECTION_CONTROL, 'retry', now + 200_000)).acquired, false);
+  assert.equal((await acquireLease(env.DB, COLLECTION_CONTROL, 'retry', now + 400_000)).acquired, true);
+  assert.equal(await claimScheduledMaintenance(env.DB, now), true);
+  assert.equal(await claimScheduledMaintenance(env.DB, now + 120_000), false);
+  assert.equal(await claimScheduledMaintenance(env.DB, now + 3_600_000), true);
+});
+
+
+test('a missing lease row prevents history and snapshot writes', async (t) => {
+  const {sqlite, env} = database(); t.after(() => sqlite.close());
+  t.mock.method(AppleMusicApi.prototype, 'recentlyPlayed', async () => {
+    sqlite.prepare("DELETE FROM collector_control WHERE name='recently_played'").run();
+    return tracks('stale', 3);
+  });
+  await assert.rejects(refreshRecentListeningAnalytics(env), /CHECK constraint failed/);
+  for (const table of ['listen_events', 'track_resource_versions', 'analytics_state']) {
+    assert.equal(sqlite.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get()!.n, 0);
+  }
 });

@@ -5,13 +5,15 @@ export class AppleMusicApiError extends Error {
   readonly status: number;
   readonly responseBody: string;
   readonly codes: string[];
+  readonly retryAfterMs: number | undefined;
 
-  constructor(status: number, responseBody: string) {
+  constructor(status: number, responseBody: string, retryAfter?: string | null) {
     super(`Apple Music API ${status}: ${responseBody.slice(0, 500)}`);
     this.name = "AppleMusicApiError";
     this.status = status;
     this.responseBody = responseBody;
     this.codes = appleErrorCodes(responseBody);
+    this.retryAfterMs = parseRetryAfterMs(retryAfter);
   }
 
   hasCode(code: string): boolean {
@@ -40,7 +42,11 @@ export async function fetchAppleMusicWithRetry(
         ...init,
         signal: AbortSignal.timeout(timeoutMs)
       });
+      // Persist a shared cooldown for 429 instead of retrying immediately or
+      // truncating a long server-requested wait to five seconds.
+      if (response.status === 429 || (parseRetryAfterMs(response.headers.get('Retry-After')) ?? 0) > 5_000) return response;
       if (!isRetryableStatus(response.status) || attempt === maxAttempts) return response;
+      await response.body?.cancel();
       await sleep(retryDelayMs(response.headers.get("Retry-After"), attempt));
     } catch (error) {
       if (attempt === maxAttempts) {
@@ -97,13 +103,21 @@ function isRetryableStatus(status: number): boolean {
   return status === 408 || status === 429 || status === 500 || status === 502 || status === 503 || status === 504;
 }
 
-function retryDelayMs(retryAfter: string | null | undefined, attempt: number): number {
-  if (retryAfter) {
-    const seconds = Number(retryAfter);
-    if (Number.isFinite(seconds) && seconds >= 0) return Math.min(seconds * 1_000, 5_000);
-    const dateMs = Date.parse(retryAfter);
-    if (Number.isFinite(dateMs)) return Math.max(0, Math.min(dateMs - Date.now(), 5_000));
+export function parseRetryAfterMs(value: string | null | undefined, now = Date.now()): number | undefined {
+  if (!value?.trim()) return undefined;
+  const text = value.trim();
+  if (/^\d+$/.test(text)) {
+    const ms = Number(text) * 1_000;
+    return Number.isSafeInteger(ms) && Number.isSafeInteger(now + ms) && Number.isFinite(new Date(now + ms).getTime()) ? ms : undefined;
   }
+  if (!/[A-Za-z]{3}/.test(text)) return undefined;
+  const dateMs = Date.parse(text);
+  return Number.isFinite(dateMs) ? Math.max(0, dateMs - now) : undefined;
+}
+
+function retryDelayMs(retryAfter: string | null | undefined, attempt: number): number {
+  const requested = parseRetryAfterMs(retryAfter);
+  if (requested !== undefined) return requested;
   return Math.min(250 * (2 ** (attempt - 1)), 2_000);
 }
 

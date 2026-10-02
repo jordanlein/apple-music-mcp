@@ -6,6 +6,7 @@ import { applySecurityHeaders, HttpRequestError, readCookie, readUrlEncodedForm,
 import { saveAppleAuthToken, setupPage } from "./setup";
 import { purgeAuditLog } from "./storage";
 import { forwardSitesCollection } from "./sites-trigger";
+import { claimScheduledMaintenance } from "./collector-control";
 import type { CloudflareEnv as Env } from "./types";
 
 const AUTH_FORM_MAX_BYTES = 2_048;
@@ -97,8 +98,11 @@ export default {
     ctx.waitUntil(
       Promise.all([
         refreshRecentListeningAnalytics(env, { limit: 30, trigger: "scheduled" }),
-        oauthProvider.purgeExpiredData(env, { batchSize: 100 }),
-        purgeAuditLog(env)
+        (async () => {
+          if (await claimScheduledMaintenance(env.DB)) {
+            await Promise.all([oauthProvider.purgeExpiredData(env, { batchSize: 100 }), purgeAuditLog(env)]);
+          }
+        })()
       ]).then(() => undefined)
     );
   }

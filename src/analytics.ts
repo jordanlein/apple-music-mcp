@@ -1,6 +1,9 @@
 import { AppleMusicApi } from "./apple";
 import { compactResource } from "./format";
 import { classifyCollectorError } from "./collector-diagnostics";
+import { AppleMusicApiError } from './apple-transport';
+import { acquireLease, COLLECTION_CONTROL, collectionFence, DEFAULT_RATE_LIMIT_COOLDOWN_MS,
+  expectedPollIntervalMs, recordRateLimitCooldown, releaseCollectionLease } from './collector-control';
 import {
   decodeHistoryCursor,
   diffRecentSnapshots,
@@ -24,12 +27,21 @@ export async function refreshRecentListeningAnalytics(
 ): Promise<AnalyticsRefreshResult> {
   const runId = crypto.randomUUID();
   const startedAt = new Date().toISOString();
+  const lease = await acquireLease(env.DB, COLLECTION_CONTROL, runId, Date.now());
+  if (!lease.acquired) {
+    return { source: 'recently_played', runId, startedAt, fetched: 0, inserted: 0, skipped: 0,
+      duplicateEvents: 0, latestCursorUpdated: false, inferredNewItems: 0, overlapItems: 0,
+      initialSnapshot: false, gapDetected: false, deferred: lease.reason, retryAt: lease.retryAt };
+  }
   try {
     await env.DB.prepare(
       "INSERT INTO collector_runs (id, trigger_source, status, started_at) VALUES (?, ?, 'running', ?)"
     ).bind(runId, options.trigger ?? "mcp", startedAt).run();
     return await collectRecentListening(env, runId, startedAt);
   } catch (error) {
+    if (error instanceof AppleMusicApiError && error.status === 429) {
+      await recordRateLimitCooldown(env.DB, error.retryAfterMs ?? DEFAULT_RATE_LIMIT_COOLDOWN_MS);
+    }
     const diagnostic = classifyCollectorError(error);
     try {
       await env.DB.prepare(
@@ -40,6 +52,9 @@ export async function refreshRecentListeningAnalytics(
     }
     console.error(JSON.stringify({ event: "collector_failed", runId, ...diagnostic }));
     throw error;
+  } finally {
+    try { await releaseCollectionLease(env.DB, runId); }
+    catch { console.error(JSON.stringify({ event: 'collector_lease_release_failed', runId })); }
   }
 }
 
@@ -145,8 +160,8 @@ async function collectRecentListening(
   }
   // D1 batch is transactional: do not advance the snapshot if any event or
   // payload insert fails. That allows the next poll to retry the same window.
-  const results = await env.DB.batch([...resourceStatements, ...insertStatements, ...stateStatements]);
-  for (const result of results.slice(resourceStatements.length, resourceStatements.length + insertStatements.length)) {
+  const results = await env.DB.batch([collectionFence(env.DB, runId, Date.now()), ...resourceStatements, ...insertStatements, ...stateStatements]);
+  for (const result of results.slice(1 + resourceStatements.length, 1 + resourceStatements.length + insertStatements.length)) {
     if (result.meta.changes > 0) inserted += 1;
     else skipped += 1;
   }
@@ -349,7 +364,8 @@ export async function analyticsStatus(env: Env): Promise<AnalyticsStatus> {
     env.DB.prepare("SELECT value FROM analytics_state WHERE key = 'recent_cursor_event_key'"),
     env.DB.prepare("SELECT COUNT(*) AS count FROM track_resource_versions"),
     env.DB.prepare("SELECT * FROM collector_runs ORDER BY started_at DESC LIMIT 20"),
-    env.DB.prepare("SELECT started_at FROM collector_runs WHERE status = 'succeeded' ORDER BY started_at DESC LIMIT 1")
+    env.DB.prepare("SELECT started_at FROM collector_runs WHERE status = 'succeeded' ORDER BY started_at DESC LIMIT 1"),
+    env.DB.prepare("SELECT lease_until_ms, cooldown_until_ms FROM collector_control WHERE name = 'recently_played'")
   ]);
   const countRow = results[0]?.results?.[0] as { count?: number } | undefined;
   const firstRow = results[1]?.results?.[0] as { observed_at?: string } | undefined;
@@ -357,6 +373,7 @@ export async function analyticsStatus(env: Env): Promise<AnalyticsStatus> {
   const runRows = (results[3]?.results ?? []) as unknown as IngestRunRow[];
   const cursor = results[4]?.results?.[0] as { value?: string } | undefined;
   const archivedRow = results[5]?.results?.[0] as { count?: number } | undefined;
+  const control = results[8]?.results?.[0] as {lease_until_ms?: number; cooldown_until_ms?: number} | undefined;
   return {
     retention: "indefinite",
     listenEvents: countRow?.count ?? 0,
@@ -367,7 +384,9 @@ export async function analyticsStatus(env: Env): Promise<AnalyticsStatus> {
     recentIngestRuns: runRows,
     recentCollectorRuns: results[6]?.results ?? [],
     collector: {
-      expectedPollIntervalMs: 300_000,
+      expectedPollIntervalMs: expectedPollIntervalMs(env),
+      collectionInProgress: (control?.lease_until_ms ?? 0) > Date.now(),
+      cooldownUntil: (control?.cooldown_until_ms ?? 0) > Date.now() ? new Date(control!.cooldown_until_ms!).toISOString() : undefined,
       lastSuccessfulPollAt: results[7]?.results?.[0]?.started_at,
       timestampsAreEstimated: true,
       skippedCountMeaning: "Duplicate database events, not skipped songs.",
@@ -424,6 +443,8 @@ interface RankedSqlRow extends Record<string, unknown> {
 }
 
 interface AnalyticsRefreshResult {
+  deferred?: 'busy' | 'cooldown';
+  retryAt?: string;
   source: "recently_played";
   fetched: number;
   inserted: number;
@@ -526,6 +547,8 @@ interface AnalyticsStatus {
   recentCollectorRuns: Record<string, unknown>[];
   collector: {
     expectedPollIntervalMs: number;
+    collectionInProgress: boolean;
+    cooldownUntil?: string;
     lastSuccessfulPollAt?: unknown;
     timestampsAreEstimated: boolean;
     skippedCountMeaning: string;

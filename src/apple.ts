@@ -209,7 +209,7 @@ export class AppleMusicApi {
     if (options.emptyOk && (response.status === 202 || response.status === 204)) return {};
     if (!response.ok) {
       const text = await response.text();
-      throw new AppleMusicApiError(response.status, text);
+      throw new AppleMusicApiError(response.status, text, response.headers.get('Retry-After'));
     }
     if (response.status === 204) return {};
     return response.json<AppleListResponse>();

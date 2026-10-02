@@ -10,3 +10,7 @@ wrangler.toml
 # Keep signing keys and account-specific hosting configuration local.
 *.p8
 .openai/hosting.json
+
+# Generated Site artifacts and local editor duplicates.
+dist/
+README [0-9]*.md

@@ -12,6 +12,7 @@ export interface Env {
   SETUP_TOKEN: string;
   OAUTH_CONSENT_TOKEN: string;
   AUDIT_RETENTION_DAYS?: string;
+  COLLECTOR_POLL_INTERVAL_SECONDS?: string;
 }
 
 export interface CloudflareEnv extends Env {

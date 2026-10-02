@@ -21,7 +21,8 @@ export async function verifySetupSession(
     const [encoded, signature, extra] = token.split(".");
     if (!encoded || !signature || extra !== undefined) return undefined;
     const expected = new Uint8Array(await hmac(encoded, secret));
-    if (!secureEqualBytes(base64UrlDecode(signature), expected)) return undefined;
+    const decodedSignature = base64UrlDecode(signature);
+    if (base64UrlEncode(decodedSignature) !== signature || !secureEqualBytes(decodedSignature, expected)) return undefined;
     const payload = JSON.parse(new TextDecoder().decode(base64UrlDecode(encoded))) as Partial<SetupSession>;
     if (
       payload.version !== 1

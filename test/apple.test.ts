@@ -5,6 +5,7 @@ import {
   fetchAppleMusicWithRetry,
   isEmptyPlaylistTracksError,
   mapWithConcurrency,
+  parseRetryAfterMs,
 } from "../src/apple-transport.ts";
 
 test("an empty playlist relationship is returned as an empty track list", async () => {
@@ -49,7 +50,7 @@ test("GET requests retry transient Apple responses", async () => {
     fetcher: async () => {
       calls += 1;
       return calls === 1
-        ? new Response("slow down", { status: 429, headers: { "Retry-After": "0" } })
+        ? new Response("slow down", { status: 503, headers: { "Retry-After": "0" } })
         : Response.json({ data: [] });
     },
     sleep: async (milliseconds) => {
@@ -92,4 +93,31 @@ test("hung requests are terminated by the configured timeout", async () => {
     }),
     /timed out after 5ms/
   );
+});
+
+test('429 responses are returned without immediate retries, preserving the server cooldown', async () => {
+  let calls = 0;
+  const response = await fetchAppleMusicWithRetry('https://example.test', {}, {
+    fetcher: async () => { calls++; return new Response('', {status: 429, headers: {'Retry-After': '900'}}); },
+    sleep: async () => { assert.fail('429 must not sleep or retry inside a poll'); }
+  });
+  assert.equal(calls, 1);
+  assert.equal(response.status, 429);
+  const error = new AppleMusicApiError(response.status, '', response.headers.get('Retry-After'));
+  assert.equal(error.retryAfterMs, 900_000);
+  assert.equal(parseRetryAfterMs('Wed, 21 Oct 2015 07:28:00 GMT', Date.parse('2015-10-21T07:20:00Z')), 480_000);
+  assert.equal(parseRetryAfterMs('-1'), undefined);
+  assert.equal(parseRetryAfterMs('8640000000000'), undefined);
+  assert.equal(parseRetryAfterMs('nonsense'), undefined);
+  assert.equal(parseRetryAfterMs(''), undefined);
+});
+
+test('long Retry-After responses are not retried before their requested wait', async () => {
+  let calls = 0;
+  const response = await fetchAppleMusicWithRetry('https://example.test', {}, {
+    fetcher: async () => { calls++; return new Response('', {status: 503, headers: {'Retry-After': '60'}}); },
+    sleep: async () => { assert.fail('long waits must not be shortened'); }
+  });
+  assert.equal(calls, 1);
+  assert.equal(response.status, 503);
 });

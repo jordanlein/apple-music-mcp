@@ -1,22 +1,25 @@
-# Apple Music MCP on Cloudflare
+# Apple Music MCP
 
-Collector diagnostics and the prepared Sites entrypoint are described in
-[Sites migration](docs/sites-migration.md). Sites supports MCP hosting; the
-destination's data import, secrets and five-minute collection schedule must be
-verified before switching away from the current deployment.
+A single-owner Apple Music MCP server with two deployment options: a standalone
+Cloudflare Worker, or a private ChatGPT Site with a Cloudflare timer forwarding
+collection requests. Both share the same observed-history model and tools.
 
-For an existing Mac checkout, follow the [Mac update and migration handoff](docs/mac-handoff.md).
+- [Cloudflare setup](#part-2-deploy-to-cloudflare) and [local development](#local-development)
+- [Private Sites setup and migration](docs/sites-migration.md)
+- [Two-minute Sites timer bridge](docs/sites-timer-bridge.md)
+- [Updating an existing checkout](docs/mac-handoff.md)
 
-Connect Apple Music to any MCP client that supports remote Streamable HTTP servers.
-
-This self-hosted server runs on Cloudflare Workers, keeps its state in your own D1 database, and uses Apple’s documented MusicKit and Apple Music API surfaces. One deployment connects to one Apple Music account.
+Cloudflare exposes bearer-key and MCP OAuth authentication for compatible remote
+Streamable HTTP clients. Sites uses its platform authentication and owner access
+checks. External harness authentication for a private Site must be tested in the
+chosen client; a URL alone does not establish compatibility.
 
 ## Why use it
 
 - Search the Apple Music catalog and inspect a connected library.
 - Read playlists, recommendations, heavy rotation, and official Replay summaries.
 - Create playlists and safely append tracks with preview, matching, and duplicate checks.
-- Collect recently played tracks every five minutes into an indefinitely retained observed-history ledger.
+- Collect recently played tracks every two minutes into an indefinitely retained observed-history ledger.
 - Query bounded history pages, summaries, and rankings for preset or exact timeframes.
 - Connect with either a static bearer key or MCP OAuth discovery.
 - Keep Apple credentials in Worker secrets and encrypt the Apple music user token before D1 storage.
@@ -30,7 +33,7 @@ flowchart LR
     Worker -->|"Developer token + music user token"| Apple["Apple Music API"]
     Worker --> D1["Cloudflare D1"]
     Worker --> KV["OAuth KV"]
-    Cron["Five-minute cron"] --> Worker
+    Cron["Two-minute cron"] --> Worker
     D1 --> Data["Observed history, analytics, audit log"]
 ```
 
@@ -38,15 +41,18 @@ The Worker signs short-lived ES256 Apple developer tokens. Browser setup obtains
 
 ## Choose a deployment
 
-| | Cloudflare deployment | Local development |
-| --- | --- | --- |
-| MCP URL | Public HTTPS Worker URL | `http://127.0.0.1:8787/mcp` |
-| Availability | Always on | Only while Wrangler and the computer are running |
-| History collection | Automatic five-minute Cron Trigger | Requires manual or host-scheduled calls to the local scheduled-test route |
-| Storage | Managed D1 and KV in your Cloudflare account | Simulated D1 and KV under `.wrangler/state` |
-| Best use | Normal remote access and durable collection | Development, testing, or a deliberately managed private host |
+| | Standalone Cloudflare | Private Sites | Local development |
+| --- | --- | --- | --- |
+| MCP endpoint | Worker `/mcp` with bearer or OAuth | Site `/mcp` with platform authentication | `http://127.0.0.1:8787/mcp` |
+| Availability | Always on | Published private Site | While Wrangler and computer run |
+| History collection | Two-minute Cron Trigger | Cloudflare timer forwards every two minutes | Manual or host-scheduled local requests |
+| Storage | D1 and OAuth KV in your account | Sites-managed `DB`; source KV retained separately for migration | Simulated D1/KV under `.wrangler/state` |
+| Best use | Compatible remote MCP clients | Sites plugin connection | Development or managed private host |
 
-Cloudflare is the recommended deployment. Neither mode can backfill listening activity from before collection begins.
+Use standalone Cloudflare for direct remote MCP client access, or private Sites
+for a Sites-managed plugin and database. Sites collection still uses a Cloudflare
+timer; its native tasks cannot supply a two-minute cadence. Neither deployment
+can backfill listening activity from before collection begins.
 
 ## Prerequisites
 
@@ -56,7 +62,8 @@ You need:
 - A Cloudflare account with Workers, D1, and KV access.
 - An Apple Developer Program account with Account Holder or Admin access for Media IDs and keys.
 - An active Apple Music subscription for the account you will connect.
-- An MCP client that supports remote Streamable HTTP servers. OAuth support is optional because a static bearer key is also available.
+- For Cloudflare, an MCP client supporting remote Streamable HTTP. OAuth is optional because a static bearer key is available.
+- For Sites, the installed Sites plugin and an account with private hosting and service-access capability.
 
 ## Part 1: Create Apple credentials
 
@@ -78,7 +85,7 @@ Keep the `.p8` file private. The server needs its complete contents, including t
 ### 1. Get the project
 
 ```bash
-git clone https://github.com/CONTRIBUTOR/apple-music-mcp.git
+git clone <YOUR_REPOSITORY_URL>
 cd apple-music-mcp
 npm ci
 ```
@@ -177,6 +184,8 @@ The migrations create:
 - `track_resource_versions` for deduplicated raw Apple payload versions.
 - `analytics_state` and `analytics_ingest_runs` for collection state and health.
 - `audit_log` for bounded MCP activity records.
+- `collector_runs` for attempted collection diagnostics.
+- `collector_control` for shared collection leases and rate-limit cooldowns.
 
 ### 6. Validate and deploy
 
@@ -269,7 +278,10 @@ Call `apple_music_status`. A healthy result resembles:
 }
 ```
 
-Then call `apple_music_analytics_status` to verify that the history collector can read its D1 state.
+Then call `apple_music_analytics_status` to verify database coverage, the configured
+poll interval, collector attempts, and any active cooldown. Observe at least two
+actual scheduled runs about two minutes apart; a configured cron or a manual
+refresh does not prove automatic collection.
 
 ## Local development
 
@@ -315,10 +327,10 @@ Do not expose port 8787 publicly. The server rejects browser requests whose `Ori
 Wrangler does not automatically fire Cron Triggers in a local session. While `npm run dev:local` is running, trigger one collection pass with:
 
 ```bash
-curl -fsS 'http://127.0.0.1:8787/__scheduled?cron=%2A%2F5+%2A+%2A+%2A+%2A'
+curl -fsS 'http://127.0.0.1:8787/__scheduled?cron=%2A%2F2+%2A+%2A+%2A+%2A'
 ```
 
-For continuous local history, schedule that request every five minutes and keep Wrangler running. Local D1 and KV state persist under `.wrangler/state`; back up that directory separately if the observed history matters.
+For continuous local history, schedule that request every two minutes and keep Wrangler running. Local D1 and KV state persist under `.wrangler/state`; back up that directory separately if the observed history matters.
 
 ## MCP tools
 
@@ -390,6 +402,36 @@ The playlist write surface is intentionally narrow:
 
 Use `dryRun: true` before large or important batches.
 
+## Collection frequency and rate limits
+
+The default is `*/2 * * * *`: one poll every two minutes, or 720 scheduled polls
+per full day before deferrals. Set `COLLECTOR_POLL_INTERVAL_SECONDS` to `120` in
+both the authoritative collector and its deployment configuration. Cloudflare
+cron timing can vary; diagnose coverage using actual stored runs.
+
+Migration `0007_collector_control.sql` adds a database-backed 180-second lease.
+Scheduled and manual refreshes share it. A concurrent request returns a `busy`
+deferral without contacting Apple. `busy` and `cooldown` deferrals return a
+temporary run ID and retry time without creating a `collector_runs` row. The
+Sites timer logs them as deferred, rather than successful polls. Successful history inserts and snapshot
+advancement run in one atomic transaction fenced by that lease; a stale writer
+cannot advance the snapshot after losing its lease.
+
+An Apple `429` causes no immediate retry. The collector persists the complete
+`Retry-After` delay, with a minimum of one minute and a five-minute default when
+Apple does not supply a valid delay. Collection requests during that window return a
+`cooldown` deferral. Inspect the reported retry time instead of issuing repeated
+manual refreshes. Apple does not publish a numeric developer-token request
+ceiling, so monitor actual `429` responses and plan-specific usage.
+
+Standalone Cloudflare runs OAuth and audit maintenance at most once per hour.
+The usual two OAuth KV list scans per cleanup are about 48 scans daily, instead
+of 1,440 if cleanup ran on every two-minute tick; additional KV pages add usage. A Sites forwarding timer performs
+zero scheduled KV operations; legacy MCP/OAuth client traffic can still use KV.
+Sites collection still consumes requests, database operations and diagnostic
+storage, so verify the hosting account's allowances before shortening the
+interval further.
+
 ## Listening-history limits
 
 Apple’s recently played endpoint is not a historical export. It returns at most 30 tracks and does not include play timestamps.
@@ -397,7 +439,8 @@ Apple’s recently played endpoint is not a historical export. It returns at mos
 As a result:
 
 - History cannot be backfilled.
-- `observedAt` is estimated within the polling interval.
+- `observedAt` is estimated within the polling interval; Apple may report changes late.
+- Faster polling improves freshness and observation bounds, but does not measure actual play duration or identify skips.
 - More than 30 changes between polls can create a permanent gap.
 - A timeframe is not complete unless the collector covered all of it without a gap.
 - The ledger retains each observed event indefinitely, while identical raw Apple payloads are content-addressed and deduplicated.
@@ -430,22 +473,27 @@ Never put access tokens, setup tokens, or OAuth tokens in a URL.
 - The Apple API origin is fixed and caller-controlled path components are encoded.
 - Tool inputs, result sizes, Apple request timeouts, retries, and concurrency are bounded.
 - Audit identity comes from authenticated server context, not a caller-supplied header.
-- Audit rows are retained for `AUDIT_RETENTION_DAYS`, defaulting to 90, and purged by the scheduled handler.
+- Standalone Cloudflare audit rows are retained for `AUDIT_RETENTION_DAYS`, defaulting to 90, with hourly audit and OAuth cleanup. Sites requires separately configured audit maintenance; setting the retention value alone does not schedule cleanup.
 - Playlist writes are append-oriented and exclude destructive operations.
 
 This remains a single-owner system. Anyone who receives either an OAuth grant or `MCP_API_KEY` can use every exposed tool against the one connected Apple Music account.
 
 ## Updating an existing deployment
 
-1. Run `npm ci`.
-2. Set the generic `MCP_API_KEY` secret to the bearer value you want clients to use.
-3. Create a new, different `OAUTH_CONSENT_TOKEN` secret.
-4. Apply all remote D1 migrations, including the audit-table migration.
-5. Deploy the Worker.
-6. Update client headers to use `MCP_API_KEY`.
-7. Open `/setup` without query parameters and reauthorize only if `apple_music_status` reports disconnected.
+Back up the database, sequence state and OAuth KV to protected local storage.
+Retain the encryption key and deployment rollback version. Follow the
+[update checklist](docs/mac-handoff.md) without replacing account-specific local
+configuration with placeholders.
 
-Migration `0005_generic_audit_log.sql` preserves existing audit rows while changing the actor field to the client-neutral `client_id` name and adding the retention index.
+Apply all database migrations before deploying code, including
+`0007_collector_control.sql`. Set `COLLECTOR_POLL_INTERVAL_SECONDS = "120"` and
+`crons = ["*/2 * * * *"]` together. Changing only the interval setting does not
+schedule requests; changing only the cron leaves incorrect diagnostics.
+
+For Sites, publish the tested Sites source and migration with the supported
+Sites workflow, then update the Cloudflare bridge timer. Keep the destination's
+collector paused during final data transfer and keep only one authoritative
+collector active. See [Sites migration](docs/sites-migration.md).
 
 ## Operations and troubleshooting
 
@@ -481,7 +529,7 @@ npx wrangler secret list
 
 ### History is shorter than expected
 
-Call `apple_music_analytics_status`, confirm the five-minute cron is deployed, and inspect recent ingest runs. Downtime and more than 30 upstream changes between polls cannot be recovered later.
+Call `apple_music_analytics_status`, confirm the two-minute cron is deployed, and inspect recent ingest runs. Downtime and more than 30 upstream changes between polls cannot be recovered later.
 
 ### Raw HTTP testing returns `Not Acceptable`
 
@@ -501,7 +549,11 @@ Local D1, KV, authorization, and history live under `.wrangler/state`. Removing 
 
 ```text
 src/
-  index.ts            Worker routes, MCP authentication, OAuth, and scheduled work
+  index.ts            Cloudflare routes, MCP authentication, OAuth, and scheduled work
+  sites.ts            Private Sites MCP and browser entrypoint
+  sites-operations.ts Authenticated service collection and migration routes
+  sites-trigger.ts    Cloudflare-to-Sites scheduled forwarding
+  collector-control.ts Shared leases, cooldowns, and hourly maintenance
   setup.ts            Protected browser MusicKit authorization flow
   setup-session.ts    Short-lived signed setup-session tokens
   http-security.ts    Body limits, cookie parsing, comparisons, and security headers
@@ -516,7 +568,10 @@ src/
   crypto.ts           ES256 signing and AES-GCM encryption
   format.ts           Compact MCP response formatting
   types.ts            Worker and Apple API types
-migrations/           Ordered D1 schema migrations
+migrations/           Ordered Cloudflare D1 schema migrations
+db/schema.ts          Sites Drizzle schema
+drizzle/              Generated Sites migrations and journal
+drizzle.config.ts     Sites migration-generation configuration
 test/                 Functional, safety, storage, and metadata tests
 wrangler.example.toml Cloudflare deployment template
 wrangler.local.toml   Local workerd, D1, and KV configuration
@@ -531,6 +586,9 @@ wrangler.local.toml   Local workerd, D1, and KV configuration
 - [Cloudflare: D1 migrations](https://developers.cloudflare.com/d1/reference/migrations/)
 - [Cloudflare: KV Wrangler commands](https://developers.cloudflare.com/workers/wrangler/commands/kv/)
 - [Cloudflare: Worker secrets](https://developers.cloudflare.com/workers/configuration/secrets/)
+- [Apple: recently played tracks](https://developer.apple.com/documentation/applemusicapi/get-v1-me-recent-played-tracks)
+- [Cloudflare: KV pricing](https://developers.cloudflare.com/kv/platform/pricing/)
+- [Sites: hosting a plugin](https://help.openai.com/en/articles/20001547-hosting-a-plugin-with-chatgpt-sites)
 - [Cloudflare: Cron Triggers](https://developers.cloudflare.com/workers/configuration/cron-triggers/)
 - [MCP: Streamable HTTP transport](https://modelcontextprotocol.io/specification/2025-06-18/basic/transports)
 - [MCP: HTTP authorization](https://modelcontextprotocol.io/specification/2025-06-18/basic/authorization)

@@ -39,3 +39,15 @@ test('timer reuse preserves legacy fetch arguments and prevents the old schedule
   assert.equal(oldScheduledCalls,0);
   assert.equal(pending.length,1);
 });
+
+
+test('busy and cooldown confirmations are reported as deferrals', async (t) => {
+  const logs: string[] = [];
+  t.mock.method(console, 'log', (message: string) => { logs.push(message); });
+  for (const deferred of ['busy', 'cooldown']) {
+    const result = await forwardSitesCollection(url, 'test-token', async () =>
+      Response.json({runId:'deferred-test', fetched:0, inserted:0, deferred, retryAt:'2026-01-01T00:00:00Z'}));
+    assert.equal(result.deferred, deferred);
+    assert.equal(JSON.parse(logs.at(-1)!).event, 'sites_collector_deferred');
+  }
+});
