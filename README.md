@@ -85,10 +85,12 @@ Keep the `.p8` file private. The server needs its complete contents, including t
 ### 1. Get the project
 
 ```bash
-git clone <YOUR_REPOSITORY_URL>
+git clone https://github.com/YOUR_GITHUB_OWNER/apple-music-mcp.git
 cd apple-music-mcp
 npm ci
 ```
+
+Replace `YOUR_GITHUB_OWNER` with the repository owner before cloning.
 
 ### 2. Sign in to Cloudflare
 

@@ -30,6 +30,18 @@ Compare the ignored `wrangler.toml` with `wrangler.example.toml`, retaining your
 own database and KV bindings. Duplicate editor copies of the README are ignored;
 do not stage them as a substitute for the tracked README.
 
+If repository history was sanitized, keep the old checkout and private local
+configuration as a backup and create a fresh clone. Port only reviewed working
+changes; merging the old history would reintroduce removed identifiers. Commit
+hashes will differ after sanitization.
+
+For project commits without personal identity metadata, configure this checkout:
+
+```sh
+git config --local user.name 'Project Contributors'
+git config --local user.email 'contributors@users.noreply.github.com'
+```
+
 ## Choose the deployment to update
 
 - **Standalone Cloudflare:** `src/index.ts`, D1 migrations in `migrations/`,
