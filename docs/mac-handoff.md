@@ -1,5 +1,10 @@
 # Mac update and migration handoff
 
+For the subsequent local cutover and reusable timer configuration, see
+[five-minute Sites collection](sites-timer-bridge.md). The remaining-work list
+below records the original remote handoff; deployment-specific completion
+evidence belongs in the protected local migration checkpoint.
+
 This handoff describes the changes prepared on October 2, 2026. The GitHub
 `main` branch is the source to update from once the accompanying pull request
 is merged. Your Mac checkout has not been inspected from this cloud executor;

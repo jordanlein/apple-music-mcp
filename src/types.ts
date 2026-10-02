@@ -17,6 +17,8 @@ export interface Env {
 export interface CloudflareEnv extends Env {
   OAUTH_KV: KVNamespace;
   OAUTH_PROVIDER: OAuthHelpers;
+  SITE_COLLECTOR_URL?: string;
+  SITE_SERVICE_TOKEN?: string;
 }
 
 export interface AppleTokenSet {

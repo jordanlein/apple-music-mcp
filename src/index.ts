@@ -5,6 +5,7 @@ import { createAppleMusicMcp } from "./mcp";
 import { applySecurityHeaders, HttpRequestError, readCookie, readUrlEncodedForm, secureEqual } from "./http-security";
 import { saveAppleAuthToken, setupPage } from "./setup";
 import { purgeAuditLog } from "./storage";
+import { forwardSitesCollection } from "./sites-trigger";
 import type { CloudflareEnv as Env } from "./types";
 
 const AUTH_FORM_MAX_BYTES = 2_048;
@@ -89,6 +90,10 @@ export default {
     return oauthProvider.fetch(request, env, ctx);
   },
   async scheduled(_controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
+    if (env.SITE_COLLECTOR_URL || env.SITE_SERVICE_TOKEN) {
+      ctx.waitUntil(forwardSitesCollection(env.SITE_COLLECTOR_URL ?? '', env.SITE_SERVICE_TOKEN ?? ''));
+      return;
+    }
     ctx.waitUntil(
       Promise.all([
         refreshRecentListeningAnalytics(env, { limit: 30, trigger: "scheduled" }),
