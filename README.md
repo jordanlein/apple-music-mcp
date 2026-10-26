@@ -34,7 +34,7 @@ flowchart LR
 
 The browser setup flow obtains a Music User Token. The server encrypts it with AES-GCM before storing it in D1, and signs short-lived ES256 developer tokens with your Apple private key. The collector compares successive recently played windows and commits new events and the new snapshot together.
 
-**Observed history is approximate.** Apple returns at most 30 recent tracks and no exact play timestamps. Collection cannot backfill old activity or guarantee complete coverage. Use official Replay for Apple's year-level totals. See [history and operations](docs/operations.md).
+**Observed history is approximate.** Apple returns at most 30 recent tracks and no exact play timestamps. Collection cannot backfill old activity or guarantee complete coverage. Use Replay for Apple's official rankings; account-wide plays/minutes are available only when Apple explicitly supplies them. See [history and operations](docs/operations.md).
 
 ## Requirements
 
@@ -185,7 +185,7 @@ For playlist verification, start with `dryRun: true`. A real create or append ch
 | `apple_music_recently_played` | Bounded observed history: timeframe, `limit`, `cursor`, `refreshFirst`. |
 | `apple_music_heavy_rotation` | Apple's heavy rotation; `limit` up to 10. |
 | `apple_music_recommendations` | Personalized recommendation groups; `limit` up to 10. |
-| `apple_music_replay_summary` | Official latest eligible year Replay summary. |
+| `apple_music_replay_summary` | Official latest eligible year rankings, catalog-enriched songs, and explicit totals availability. |
 | `apple_music_list_playlists` | Library playlists and editability; `limit` up to 500. |
 | `apple_music_get_playlist_tracks` | Playlist tracks: `playlistId`, `limit` up to 500. |
 | `apple_music_search_catalog` | Catalog search: `term`, `types`, `limit` up to 25. |
@@ -233,7 +233,13 @@ Or provide an inclusive `start` and optional exclusive `end`, with explicit UTC/
 }
 ```
 
-Calendar presets default to `America/Denver`; pass your own IANA `timeZone` as needed. For pagination, keep the same timeframe and use the returned `nextCursor` while `hasMore=true`. Custom ranges, SQL aggregation, and estimated timestamps all refer to the observed ledger, not complete Apple playback records.
+Calendar presets default to `America/Denver`; pass your own IANA `timeZone` as needed. Reuse a returned `timeframe.asOf` as the optional `asOf` input on other preset queries to keep their bounds aligned. Use exact start/end without `asOf` for custom ranges. The ledger remains live, so this does not freeze the database. For pagination, keep the same timeframe and use the returned `nextCursor` while `hasMore=true`. Custom ranges, SQL aggregation, and estimated timestamps all refer to the observed ledger, not complete Apple playback records.
+
+### Replay and ranking details
+
+Replay preserves Apple’s ranking order and fills missing song names, artists, and links through bounded catalog-ID lookups. `songMetadata` and per-song `metadataStatus` disclose missing/unavailable metadata without inventing a match. `totalsAvailable=false` means the response contains no account-wide listening totals; an album’s catalog track count is not a play count. `rankingInfo` reports the different returned list lengths, and `coverage.periodState` identifies current-year rankings that can change.
+
+Observed rankings expose `name` consistently while retaining the legacy `key`. Album IDs and links use valid recorded Apple Music album URLs or catalog lookups from archived song catalog IDs, with album/artist checks; unavailable or mismatched references are not fabricated. Heavy Rotation preserves Apple’s resource order and can contain playlists or albums without ranks or play counts; use observed top stats for measured rankings.
 
 ## Local development
 

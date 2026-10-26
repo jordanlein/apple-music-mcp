@@ -14,6 +14,7 @@ export const timeframePresetValues = [
 export type TimeframePreset = (typeof timeframePresetValues)[number];
 
 export interface TimeframeOptions {
+  asOf?: string;
   preset?: TimeframePreset;
   start?: string;
   end?: string;
@@ -21,6 +22,7 @@ export interface TimeframeOptions {
 }
 
 export interface ResolvedTimeframe {
+  asOf?: string;
   mode: "preset" | "custom";
   preset?: TimeframePreset;
   startIso?: string;
@@ -34,6 +36,13 @@ export function resolveTimeframe(
   now = new Date()
 ): ResolvedTimeframe {
   if (!Number.isFinite(now.getTime())) throw new Error("The current time is invalid.");
+  if (options.asOf !== undefined) {
+    if (options.start !== undefined || options.end !== undefined) throw new Error('Use asOf with a preset, or use exact start/end bounds without asOf.');
+    const anchor = parseBoundedIso(options.asOf, 'asOf');
+    if (Date.parse(anchor) > now.getTime()) throw new Error('asOf cannot be in the future.');
+    now = new Date(anchor);
+  }
+  const asOf = now.toISOString();
   const timeZone = validateTimeZone(options.timeZone ?? DEFAULT_HISTORY_TIME_ZONE);
   const hasPreset = options.preset !== undefined;
   const hasCustom = options.start !== undefined || options.end !== undefined;
@@ -55,6 +64,7 @@ export function resolveTimeframe(
     }
     return {
       mode: "custom",
+      asOf,
       startIso,
       endIso,
       label: `${startIso} through ${endIso}`,
@@ -65,7 +75,7 @@ export function resolveTimeframe(
   const preset = options.preset ?? "7d";
   const endIso = now.toISOString();
   if (preset === "all_time") {
-    return { mode: "preset", preset, endIso, label: "All observed history", timeZone };
+    return { mode: "preset", preset, endIso, asOf, label: "All observed history", timeZone };
   }
 
   let start: Date;
@@ -93,6 +103,7 @@ export function resolveTimeframe(
 
   return {
     mode: "preset",
+    asOf,
     preset,
     startIso: start.toISOString(),
     endIso: end.toISOString(),
@@ -101,7 +112,7 @@ export function resolveTimeframe(
   };
 }
 
-function parseBoundedIso(value: string, field: "start" | "end"): string {
+function parseBoundedIso(value: string, field: "start" | "end" | "asOf"): string {
   if (!/(?:Z|[+-]\d{2}:\d{2})$/i.test(value)) {
     throw new Error(`The custom ${field} must be an ISO 8601 timestamp with Z or a UTC offset.`);
   }

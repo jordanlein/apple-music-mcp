@@ -50,3 +50,15 @@ test("future custom endpoints and invalid time zones are rejected", () => {
   }, now), /cannot be in the future/);
   assert.throws(() => resolveTimeframe({ preset: "today", timeZone: "Mars/Olympus" }, now), /Invalid IANA time zone/);
 });
+
+test('asOf anchors rolling and calendar presets across later calls and rejects ambiguous/future anchors',()=>{
+ const anchor='2026-02-10T12:00:00Z';
+ for(const preset of ['30d','last_year'] as const){
+  const first=resolveTimeframe({preset,asOf:anchor},new Date('2026-03-01T00:00:00Z'));
+  const later=resolveTimeframe({preset,asOf:first.asOf},new Date('2027-03-01T00:00:00Z'));
+  assert.deepEqual(first,later);
+ }
+ assert.throws(()=>resolveTimeframe({preset:'30d',asOf:'2027-01-01T00:00:00Z'},new Date('2026-01-01T00:00:00Z')),/future/);
+ assert.throws(()=>resolveTimeframe({start:'2026-01-01T00:00:00Z',asOf:anchor}),/asOf/);
+ assert.throws(()=>resolveTimeframe({asOf:'2026-02-10T12:00:00'}),/offset/);
+});

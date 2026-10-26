@@ -4,7 +4,7 @@
 
 The collector observes Apple's recently played window, up to 30 tracks, every two minutes. Apple does not supply exact play timestamps here. `observedAt` values are estimates, and repeated plays, late upstream updates, downtime, or more than 30 changes between polls can make coverage incomplete. It cannot reconstruct unobserved activity or infer exactly which songs were skipped.
 
-Use `apple_music_replay_summary` for Apple's official latest eligible year Replay data. Use the D1 history tools for the ledger observed since collection began. A gap between song timestamps does not establish collector downtime. A full new window without overlap flags possible coverage loss, not a known number of missing plays. `skipped_count` refers to duplicate event inserts, not skipped songs.
+Use `apple_music_replay_summary` for Apple's official latest eligible year Replay rankings. Check `totalsAvailable`: Apple may omit account-wide plays/minutes, and catalog album track counts must never be treated as listening totals. Use the D1 history tools for the ledger observed since collection began. A gap between song timestamps does not establish collector downtime. A full new window without overlap flags possible coverage loss, not a known number of missing plays. `skipped_count` refers to duplicate event inserts, not skipped songs.
 
 Listening events and distinct raw payload versions have no automatic retention cutoff. That policy is bounded by finite database storage. Future identical raw payloads are deduplicated by hash; this does not remove their separate listening events.
 
@@ -100,6 +100,12 @@ Protect backups with restrictive filesystem permissions and suitable encrypted s
 During a move, prepare/import the destination while the source remains authoritative. Pause source collection briefly for a final delta, verify the latest state, then enable the destination's single collector. After cutover, rollback must first transfer all new destination data back. Pointing a Worker at a stale backup or enabling two independent collectors can lose or duplicate observations. Do not delete the former environment during initial acceptance.
 
 The Sites entrypoint has separate migration/service controls. Keep import access disabled after a move; the public repository must not contain actual exports or account-specific migration receipts. See [Sites migration](sites-migration.md) and [proxy mode](clients.md#optional-owner-private-sites-proxy).
+
+## Comparing queries
+
+Preset queries return `timeframe.asOf`. Pass that timestamp as `asOf` to history, summary, and top-stat tools to align rolling/calendar boundaries across calls. Custom start/end bounds are another option. This fixes the range, not the ledger version: subsequent collection and inferred observations can still change counts. Estimated `observedAt` timestamps remain estimates.
+
+Replay and observed-album metadata hydration use batched, storefront-scoped 24-hour catalog caching. Observed counts/ranks stay SQL-derived; optional album display metadata can use Apple catalog reads and remains unavailable when those reads fail. Failed or unavailable song lookups leave the official rank/ID intact with explicit metadata status. Different top-list lengths are reported as supplied by Apple; no entries or listening totals are invented to make the lists uniform.
 
 ## Sources
 

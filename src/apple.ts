@@ -102,6 +102,35 @@ export class AppleMusicApi {
     return this.request("/me/music-summaries?filter%5Byear%5D=latest&views=top-artists,top-albums,top-songs", { user: true });
   }
 
+  async catalogSongs(ids: string[]): Promise<AppleResource[]> {
+    return this.catalogResources('songs', ids);
+  }
+
+  async catalogAlbums(ids: string[]): Promise<AppleResource[]> {
+    return this.catalogResources('albums', ids);
+  }
+
+  private async catalogResources(type: 'songs' | 'albums', ids: string[]): Promise<AppleResource[]> {
+    const unique = [...new Set(ids)];
+    const limit = type === 'songs' ? 300 : 100;
+    if (unique.length > limit) throw new Error(`Catalog ${type} lookup is limited to ${limit} IDs.`);
+    if (!unique.length) return [];
+    const storefront = await this.userStorefront();
+    const key = JSON.stringify(['catalog-' + type, storefront, [...unique].sort()]);
+    const cacheEnabled = Boolean((this.env as CloudflareEnv).CATALOG_RESOLVER);
+    const cached = cacheEnabled ? await this.env.DB.prepare('SELECT value FROM catalog_cache WHERE key = ? AND expires_at_ms > ?')
+      .bind(key, Date.now()).first<{value: string}>() : null;
+    if (cached) return JSON.parse(cached.value);
+    const songs: AppleResource[] = [];
+    for (const batch of chunks(unique, 100)) {
+      const response = await this.request(`/catalog/${encodeURIComponent(storefront)}/${type}?ids=${encodeURIComponent(batch.join(','))}`, {user:false});
+      songs.push(...(response.data ?? []));
+    }
+    if (cacheEnabled) await this.env.DB.prepare('INSERT INTO catalog_cache (key,value,expires_at_ms) VALUES (?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,expires_at_ms=excluded.expires_at_ms')
+      .bind(key, JSON.stringify(songs), Date.now() + 86_400_000).run();
+    return songs;
+  }
+
   async heavyRotation(limit: number): Promise<AppleResource[]> {
     const response = await this.request(`/me/history/heavy-rotation?limit=${Math.min(limit, 10)}`, { user: true });
     return (response.data ?? []).slice(0, limit);

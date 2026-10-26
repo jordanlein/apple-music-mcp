@@ -9,6 +9,7 @@ import type { ToolContext } from "./types";
 import { AppleMusicWriteUncertainError } from './apple-transport';
 
 const TIMEFRAME_INPUT_SCHEMA = {
+  asOf: z.string().optional().describe('Optional fixed ISO timestamp with Z/offset for preset windows. Reuse returned timeframe.asOf across tools to align bounds. Use exact start/end instead for custom ranges. This fixes query bounds, not a database snapshot.'),
   preset: z.enum(timeframePresetValues).optional().describe("Convenient range: today, rolling 24h/7d/30d/90d, ytd, last_year, or all_time. Defaults to 7d. Do not combine with start or end."),
   start: z.string().optional().describe("Custom inclusive start as an ISO 8601 timestamp with Z or a UTC offset. Use instead of preset."),
   end: z.string().optional().describe("Optional custom exclusive end as an ISO 8601 timestamp with Z or a UTC offset. Requires start and defaults to now."),
@@ -101,7 +102,7 @@ export function createAppleMusicMcp(ctx: ToolContext, onlyTool?: string): McpSer
     "apple_music_recently_played",
     toolConfig("apple_music_recently_played", () => ({
       title: "Get Recently Played History",
-      description: "Use when the user asks which tracks they listened to during any observed timeframe. Choose one preset or provide an exact custom start/end range; history is retained indefinitely from the collector's first observation. Returns a bounded newest-first page from Cloudflare D1. If hasMore is true, repeat the same timeframe with nextCursor; never request all matching tracks in one response. Coverage is approximate and cannot predate the collector; use apple_music_replay_summary for official year-level totals. With refreshFirst=true this safely updates the backend ledger but never changes the Apple Music library.",
+      description: "Use when the user asks which tracks they listened to during any observed timeframe. Choose one preset or provide an exact custom start/end range; history is retained indefinitely from the collector's first observation. Returns a bounded newest-first page from Cloudflare D1. If hasMore is true, repeat the same timeframe with nextCursor; never request all matching tracks in one response. Coverage is approximate and cannot predate the collector; use apple_music_replay_summary for official year-level rankings and any totals Apple actually supplies. With refreshFirst=true this safely updates the backend ledger but never changes the Apple Music library.",
       annotations: REFRESHING_READ,
       inputSchema: {
         ...TIMEFRAME_INPUT_SCHEMA,
@@ -110,9 +111,9 @@ export function createAppleMusicMcp(ctx: ToolContext, onlyTool?: string): McpSer
         refreshFirst: z.boolean().default(true).describe("Refresh the 30-track Apple window before querying Cloudflare history.")
       }
     })),
-    async ({ preset, start, end, timeZone, limit, cursor, refreshFirst }) => {
+    async ({ preset, start, end, timeZone, asOf, limit, cursor, refreshFirst }) => {
       if (refreshFirst) await refreshRecentListeningAnalytics(ctx.env);
-      const result = await recentListeningHistory(ctx.env, { preset, start, end, timeZone, limit, cursor });
+      const result = await recentListeningHistory(ctx.env, { preset, start, end, timeZone, asOf, limit, cursor });
       await audit(ctx.env, ctx.clientId, "apple_music_recently_played", "read", {
         preset,
         start,
@@ -131,7 +132,7 @@ export function createAppleMusicMcp(ctx: ToolContext, onlyTool?: string): McpSer
     "apple_music_heavy_rotation",
     toolConfig("apple_music_heavy_rotation", () => ({
       title: "Get Heavy Rotation",
-      description: "Use when the user asks for their heavy rotation, frequently played music, favorites they keep returning to, or an Apple Music equivalent of 'On Repeat'. Returns Apple's current personalized heavy-rotation resources. This is Apple's opaque ranking rather than a requested date-range calculation; use apple_music_top_stats for ranked observed plays over a specific supported period.",
+      description: "Use when the user asks for Apple's heavy-rotation resources. Apple may return albums, playlists, songs, or other resources, with no play counts or explanation. Preserve Apple's returned order; do not describe it as a measured song ranking or 'On Repeat' track list. Use apple_music_top_stats for ranked observed plays over a specific period.",
       annotations: READ_ONLY_APPLE,
       inputSchema: {
         limit: z.number().int().min(1).max(10).default(10).describe("Maximum heavy-rotation resources to return, from 1 to Apple Music's endpoint maximum of 10.")
@@ -141,7 +142,8 @@ export function createAppleMusicMcp(ctx: ToolContext, onlyTool?: string): McpSer
       const api = new AppleMusicApi(ctx.env);
       const items = await api.heavyRotation(limit);
       await audit(ctx.env, ctx.clientId, "apple_music_heavy_rotation", "read", { limit, count: items.length });
-      return jsonText({ items: compactResources(items) });
+      return jsonText({ items: compactResources(items), source: 'apple_music_heavy_rotation', order: 'apple_returned_order', isPlayCountRanking: false,
+        note: 'Apple may return playlists or albums rather than songs. No play counts, explicit ranks, or selection explanation are supplied; use observed top stats for measured rankings.' });
     }
   );
 
@@ -167,7 +169,7 @@ export function createAppleMusicMcp(ctx: ToolContext, onlyTool?: string): McpSer
     "apple_music_replay_summary",
     toolConfig("apple_music_replay_summary", () => ({
       title: "Get Official Replay Summary",
-      description: "Use when the user asks for their official Apple Music Replay, latest eligible year totals, listening minutes, or year-level top artists, albums, and songs. Returns Apple's authoritative Replay summary. Prefer this over apple_music_listening_summary or apple_music_top_stats for year-level claims because the backend observed-history ledger is incomplete.",
+      description: "Use when the user asks for official Apple Music Replay rankings for the latest eligible year. Songs are enriched with catalog names/artists/links when available. Apple may omit total plays/minutes: inspect totalsAvailable and never infer listening totals from album track counts. Current-year lists can change and list lengths may differ. Prefer Apple's rankings over the incomplete observed ledger for year-level claims.",
       annotations: READ_ONLY_APPLE,
       inputSchema: {}
     })),
@@ -398,16 +400,16 @@ export function createAppleMusicMcp(ctx: ToolContext, onlyTool?: string): McpSer
     "apple_music_listening_summary",
     toolConfig("apple_music_listening_summary", () => ({
       title: "Summarize Observed Listening",
-      description: "Use for a Stats.fm/Airbuds-style overview of observed listening during any preset or exact custom timeframe. Returns SQL-computed estimated plays and listening minutes, unique counts, top tracks/artists/albums/genres, recent tracks, and explicit coverage metadata without loading the full history into the client or Worker. The ledger is retained indefinitely but begins when the collector first observed plays; use apple_music_replay_summary for official year-level totals, apple_music_recently_played for a paged track sequence, or apple_music_top_stats for one ranked category.",
+      description: "Use for a Stats.fm/Airbuds-style overview of observed listening during any preset or exact custom timeframe. Returns SQL-computed estimated plays and listening minutes, unique counts, top tracks/artists/albums/genres, recent tracks, and explicit coverage metadata without loading the full history into the client or Worker. The ledger is retained indefinitely but begins when the collector first observed plays; use apple_music_replay_summary for official year-level rankings and any totals Apple actually supplies, apple_music_recently_played for a paged track sequence, or apple_music_top_stats for one ranked category.",
       annotations: REFRESHING_READ,
       inputSchema: {
         ...TIMEFRAME_INPUT_SCHEMA,
         refreshFirst: z.boolean().default(true).describe("Refresh Apple's current 30-track window into the backend ledger before summarizing; defaults to true and does not modify the Apple Music library.")
       }
     })),
-    async ({ preset, start, end, timeZone, refreshFirst }) => {
+    async ({ preset, start, end, timeZone, asOf, refreshFirst }) => {
       if (refreshFirst) await refreshRecentListeningAnalytics(ctx.env);
-      const timeframe = { preset, start, end, timeZone };
+      const timeframe = { preset, start, end, timeZone, asOf };
       const result = await listeningSummary(ctx.env, timeframe);
       await audit(ctx.env, ctx.clientId, "apple_music_listening_summary", "read", { ...timeframe, refreshFirst });
       return jsonText(result);
@@ -427,9 +429,9 @@ export function createAppleMusicMcp(ctx: ToolContext, onlyTool?: string): McpSer
         refreshFirst: z.boolean().default(true).describe("Refresh Apple's current 30-track window into the backend ledger before ranking; defaults to true and does not modify the Apple Music library.")
       }
     })),
-    async ({ preset, start, end, timeZone, kind, limit, refreshFirst }) => {
+    async ({ preset, start, end, timeZone, asOf, kind, limit, refreshFirst }) => {
       if (refreshFirst) await refreshRecentListeningAnalytics(ctx.env);
-      const timeframe = { preset, start, end, timeZone };
+      const timeframe = { preset, start, end, timeZone, asOf };
       const result = await topListeningStats(ctx.env, timeframe, kind, limit);
       await audit(ctx.env, ctx.clientId, "apple_music_top_stats", "read", { ...timeframe, kind, limit, refreshFirst });
       return jsonText(result);

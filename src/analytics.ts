@@ -285,10 +285,10 @@ export async function listeningSummary(env: Env, options: TimeframeOptions = {})
       uniqueArtists: Number(totals.unique_artists ?? 0),
       uniqueAlbums: Number(totals.unique_albums ?? 0)
     },
-    topTracks: rankedRows(results[1], totalPlays),
-    topArtists: rankedRows(results[2], totalPlays),
-    topAlbums: rankedRows(results[3], totalPlays),
-    topGenres: rankedRows(results[4], totalPlays),
+    topTracks: rankedRows(results[1], totalPlays, 'tracks'),
+    topArtists: rankedRows(results[2], totalPlays, 'artists'),
+    topAlbums: await enrichAlbumRankings(env, rankedRows(results[3], totalPlays, 'albums')),
+    topGenres: rankedRows(results[4], totalPlays, 'genres'),
     recentTracks: ((results[5]?.results ?? []) as unknown as ListenEventRow[]).map(rowToTrack)
   };
 }
@@ -297,18 +297,48 @@ export async function appleReplaySummary(env: Env): Promise<AppleReplaySummary> 
   const api = new AppleMusicApi(env);
   const response = await api.replaySummary();
   const summary = response.data?.[0];
+  const topSongs = replayView(summary, 'top-songs', 'song');
+  const missing = topSongs.filter(row => row.resource?.type === 'songs' &&
+    (!row.resource.name || !row.resource.artistName || !row.resource.url));
+  let lookupFailed = false;
+  let catalog: AppleResource[] = [];
+  if (missing.length) {
+    try { catalog = await api.catalogSongs(missing.map(row => String(row.resource!.id)).slice(0, 300)); }
+    catch { lookupFailed = true; }
+  }
+  const byId = new Map(catalog.map(song => [song.id, song]));
+  for (const row of topSongs) {
+    const song = byId.get(String(row.resource?.id));
+    if (song) row.resource = {...compactResource(song), ...Object.fromEntries(Object.entries(row.resource ?? {}).filter(([,value]) => value !== undefined))};
+    row.metadataStatus = row.resource?.name && row.resource?.artistName && row.resource?.url
+      ? song ? 'catalog_enriched' : 'provided_by_apple' : 'unavailable';
+  }
+  const totals = extractReplayMetrics(summary?.attributes);
+  const year = numberOrNull(summary?.attributes?.year);
+  const now = new Date();
   return {
     source: "apple_music_replay",
     coverage: {
       isOfficialAppleReplay: true,
       period: stringOrNull(summary?.attributes?.period),
-      year: numberOrNull(summary?.attributes?.year),
-      note: "Official Apple Music Replay data for the latest eligible year. Apple exposes this separately from recently played history; use this for year-level totals and top content."
+      year,
+      asOf: now.toISOString(),
+      periodState: year === now.getUTCFullYear() ? 'in_progress' : year !== null && year < now.getUTCFullYear() ? 'past_period' : 'unknown',
+      note: "Official Apple Music Replay rankings for the latest eligible year. Current-year rankings can change. Account-wide totals are available only when explicitly supplied by Apple; do not substitute album track counts or observed-ledger estimates."
     },
-    totals: extractReplayMetrics(response),
+    totals,
+    totalsAvailable: totals.length > 0,
+    totalsNote: totals.length ? 'Metrics explicitly supplied in summary attributes; preserve their original names and units.' : 'Apple did not supply account-wide listening totals. Album track counts are not listening totals.',
     topArtists: replayView(summary, "top-artists", "artist"),
     topAlbums: replayView(summary, "top-albums", "album"),
-    topSongs: replayView(summary, "top-songs", "song"),
+    topSongs,
+    songMetadata: {lookupFailed, requested: missing.length, enriched: topSongs.filter(row => row.metadataStatus === 'catalog_enriched').length,
+      unavailable: topSongs.filter(row => row.metadataStatus === 'unavailable').length},
+    rankingInfo: Object.fromEntries(['top-songs','top-artists','top-albums'].map(view => [view, {
+      returned: summary?.views?.[view]?.data?.length ?? 0,
+      continuationProvided: Boolean(summary?.views?.[view]?.next)
+    }])),
+    rankingNote: 'List lengths and ordering come from Apple and may differ between songs, artists, and albums; these are selected top lists, not all listening activity.',
     rawSummary: summary ? {
       id: summary.id,
       type: summary.type,
@@ -341,7 +371,7 @@ export async function topListeningStats(
   return {
     kind,
     timeframe: serializeTimeframe(window),
-    items: rankedRows(results[1], totalPlays),
+    items: kind === 'albums' ? await enrichAlbumRankings(env, rankedRows(results[1], totalPlays, kind)) : rankedRows(results[1], totalPlays, kind),
     coverage: {
       eventCount: totalPlays,
       firstObservedAt: stringOrUndefined(totals.first_observed_at),
@@ -429,6 +459,8 @@ interface TotalsRow extends Record<string, unknown> {
 }
 
 interface RankedSqlRow extends Record<string, unknown> {
+  album_source_url?: string;
+  catalog_song_id?: string;
   key?: string;
   plays?: number;
   duration_ms?: number;
@@ -509,9 +541,16 @@ interface AppleReplaySummary {
     isOfficialAppleReplay: true;
     period: string | null;
     year: number | null;
+    asOf: string;
+    periodState: string;
     note: string;
   };
   totals: Array<{ path: string; value: number | string }>;
+  totalsAvailable: boolean;
+  totalsNote: string;
+  songMetadata: {lookupFailed: boolean; requested: number; enriched: number; unavailable: number};
+  rankingInfo: Record<string, {returned: number; continuationProvided: boolean}>;
+  rankingNote: string;
   topArtists: ReplayRankedItem[];
   topAlbums: ReplayRankedItem[];
   topSongs: ReplayRankedItem[];
@@ -519,6 +558,7 @@ interface AppleReplaySummary {
 }
 
 interface ReplayRankedItem {
+  metadataStatus?: string;
   rank: number;
   periodSummaryId: string;
   periodSummaryType: string;
@@ -557,6 +597,9 @@ interface AnalyticsStatus {
 interface RankedItem {
   rank: number;
   key: string;
+  name: string;
+  id?: string;
+  url?: string;
   plays: number;
   listeningMinutes: number;
   share: number;
@@ -619,7 +662,11 @@ function rankedStatement(env: Env, kind: TopKind, window: ResolvedTimeframe, lim
          FROM listen_events`
       : `SELECT album_name || '||' || COALESCE(artist_name, '') AS key,
          COUNT(*) AS plays, COALESCE(SUM(duration_ms), 0) AS duration_ms,
-         MAX(album_name) AS album_name, MAX(artist_name) AS artist_name, MAX(artwork_url) AS artwork_url
+         MAX(album_name) AS album_name, MAX(artist_name) AS artist_name, MAX(artwork_url) AS artwork_url,
+         MAX(apple_url) AS album_source_url,
+         MAX(COALESCE(json_extract(raw_json, '$.attributes.playParams.catalogId'),
+           (SELECT json_extract(v.raw_json, '$.attributes.playParams.catalogId') FROM track_resource_versions v WHERE v.resource_hash = listen_events.resource_hash),
+           CASE WHEN resource_type = 'songs' AND track_id <> '' AND track_id NOT GLOB '*[^0-9]*' THEN track_id END)) AS catalog_song_id
          FROM listen_events`;
   const nonNull = kind === "artists" ? "AND artist_name IS NOT NULL" : kind === "albums" ? "AND album_name IS NOT NULL" : "";
   const groupBy = kind === "tracks" ? "track_id" : kind === "artists" ? "artist_name" : "album_name, artist_name";
@@ -633,22 +680,29 @@ function rankedStatement(env: Env, kind: TopKind, window: ResolvedTimeframe, lim
   );
 }
 
-function rankedRows(result: D1Result<Record<string, unknown>> | undefined, totalPlays: number): RankedItem[] {
+function rankedRows(result: D1Result<Record<string, unknown>> | undefined, totalPlays: number, kind: TopKind): RankedItem[] {
   return ((result?.results ?? []) as RankedSqlRow[]).map((row, index) => {
     const plays = Number(row.plays ?? 0);
+    const album = kind === 'albums' ? albumReference(row.album_source_url) : undefined;
+    const name = String(kind === 'tracks' ? row.name ?? row.key ?? 'Unknown' : kind === 'albums' ? row.album_name ?? 'Unknown' : row.key ?? 'Unknown');
     const sample = row.track_id || row.name || row.artist_name || row.album_name || row.artwork_url || row.apple_url
       ? {
-          id: row.track_id,
-          name: row.name ?? row.album_name,
+          id: kind === 'albums' ? album?.id : row.track_id,
+          name,
           artistName: row.artist_name,
           albumName: row.album_name,
+          catalogSongId: kind === 'albums' ? row.catalog_song_id : undefined,
           artworkUrl: row.artwork_url,
-          url: row.apple_url
+          url: kind === 'albums' ? album?.url : row.apple_url,
+          metadataStatus: kind === 'albums' ? album ? 'album_reference_from_recorded_song_url' : 'unavailable_in_observed_history' : undefined
         }
       : undefined;
     return {
       rank: index + 1,
       key: String(row.key ?? "Unknown"),
+      name,
+      id: kind === 'albums' ? album?.id : row.track_id,
+      url: kind === 'albums' ? album?.url : row.apple_url,
       plays,
       listeningMinutes: Math.round(Number(row.duration_ms ?? 0) / 60000),
       share: totalPlays ? Number((plays / totalPlays).toFixed(3)) : 0,
@@ -657,8 +711,46 @@ function rankedRows(result: D1Result<Record<string, unknown>> | undefined, total
   });
 }
 
+function albumReference(value: string | undefined): {id: string; url: string} | undefined {
+  if (!value) return;
+  try {
+    const url = new URL(value);
+    if (url.protocol !== 'https:' || url.hostname !== 'music.apple.com') return;
+    const match = url.pathname.match(/\/album\/(?:[^/]+\/)?(\d+)\/?$/);
+    if (!match) return;
+    url.search = ''; url.hash = '';
+    return {id:match[1],url:url.toString()};
+  } catch { return; }
+}
+
+async function enrichAlbumRankings(env: Env, items: RankedItem[]): Promise<RankedItem[]> {
+  const missing = items.filter(item => !item.id && /^\d+$/.test(String(item.sample?.catalogSongId ?? '')));
+  if (!missing.length) return items;
+  try {
+    const api = new AppleMusicApi(env);
+    const songs = new Map((await api.catalogSongs(missing.map(item => String(item.sample!.catalogSongId)))).map(song => [song.id,song]));
+    const matches = missing.flatMap(item => {
+      const song = songs.get(String(item.sample!.catalogSongId));
+      const album = song?.relationships?.albums?.data?.[0];
+      if (!album || song?.attributes?.albumName !== item.name || song?.attributes?.artistName !== item.sample?.artistName) return [];
+      return [{item, albumId:album.id}];
+    });
+    const albums = new Map((await api.catalogAlbums(matches.map(match => match.albumId))).map(album => [album.id,album]));
+    for (const {item,albumId} of matches) {
+      const album = albums.get(albumId);
+      if (!album || album.attributes?.name !== item.name || typeof album.attributes?.url !== 'string') continue;
+      item.id = album.id; item.url = album.attributes.url;
+      item.sample = {...item.sample,id:item.id,url:item.url,metadataStatus:'catalog_enriched'};
+    }
+  } catch {
+    for (const item of missing) item.sample = {...item.sample,metadataStatus:'catalog_lookup_failed'};
+  }
+  return items;
+}
+
 function serializeTimeframe(window: ResolvedTimeframe) {
   return {
+    asOf: window.asOf,
     mode: window.mode,
     preset: window.preset,
     label: window.label,
@@ -718,8 +810,9 @@ function replayView(summary: AppleResource | undefined, viewName: string, relati
 
 function extractReplayMetrics(value: unknown): Array<{ path: string; value: number | string }> {
   const metrics: Array<{ path: string; value: number | string }> = [];
-  const interesting = /(minute|duration|play|count|total|time|hour|listen)/i;
-  walkMetricValues(value, "$", interesting, metrics);
+  const interesting = /^(?:total)?(?:plays|playCount|listeningMinutes|listeningTime(?:InMillis|InMinutes)?|minutesListened|hoursListened|duration(?:InMillis|InMinutes)?|minutes|hours)$/i;
+  // Never walk views/relationships: their catalog trackCount is not listening.
+  walkMetricValues(value, "$.summary.attributes", interesting, metrics);
   return metrics.slice(0, 50);
 }
 
@@ -731,8 +824,9 @@ function walkMetricValues(value: unknown, path: string, interesting: RegExp, met
   }
   if (typeof value !== "object") return;
   for (const [key, child] of Object.entries(value)) {
+    if (/^(views|relationships|data|top[-_]?.*|songs|albums|artists)$/i.test(key)) continue;
     const childPath = `${path}.${key}`;
-    if (interesting.test(key) && (typeof child === "number" || typeof child === "string")) {
+    if (interesting.test(key) && (typeof child === "number" || typeof child === "string" && child.trim() !== '' && Number.isFinite(Number(child)))) {
       metrics.push({ path: childPath, value: child });
     }
     walkMetricValues(child, childPath, interesting, metrics);
@@ -769,7 +863,7 @@ function coverageNote(): string {
 }
 
 function summaryCoverageNote(): string {
-  return "Observed-only indefinite ledger from Apple Music recently played. This is not a complete historical Apple Music total: collection begins when the collector starts, timestamps are estimated, and polling gaps remain possible. Use apple_music_replay_summary for Apple's official latest-year Replay totals.";
+  return "Observed-only indefinite ledger from Apple Music recently played. This is not a complete historical Apple Music total: collection begins when the collector starts, timestamps are estimated, and polling gaps remain possible. Use apple_music_replay_summary for official latest-year rankings and only the totals Apple explicitly supplies. Counts are live snapshots; asOf aligns query bounds, not an immutable database snapshot.";
 }
 
 function chunk<T>(values: T[], size: number): T[][] {

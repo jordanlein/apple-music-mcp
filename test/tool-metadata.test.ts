@@ -23,7 +23,7 @@ test("playlist workflow metadata teaches batching and sequencing", () => {
 });
 
 test("analytics metadata distinguishes observed history from official Replay", () => {
-  assert.match(source, /use apple_music_replay_summary for official year-level totals/);
+  assert.match(source, /use apple_music_replay_summary for official year-level rankings/);
   assert.match(source, /apple_music_recently_played for a paged track sequence/);
   assert.match(source, /apple_music_top_stats for one ranked category/);
 });
