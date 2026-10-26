@@ -1,5 +1,8 @@
 # Deploy privately on Sites or migrate from Cloudflare
 
+This guide covers Sites-owned storage. For a thin Sites plugin proxy over a
+Cloudflare backend, follow [proxy mode](clients.md#optional-owner-private-sites-proxy).
+
 The Site exposes the same Apple Music tools through stateless `POST /mcp` and
 Sites-managed authentication. Use `src/sites.ts`, not the standalone Cloudflare
 OAuth entrypoint. The database schema is in `db/schema.ts`; generated Sites
@@ -50,8 +53,8 @@ checklist below when moving a populated database.
 
 The two-minute bridge invokes collection only; it does not run standalone
 Cloudflare OAuth or audit cleanup. Sites audit retention needs separately
-configured maintenance. The ingest diagnostic table prunes its older entries
-within collection, while observed history remains indefinite.
+configured maintenance. Sites must also configure indexed ingestion-diagnostic maintenance separately;
+collection itself no longer prunes diagnostics. Observed history remains indefinite.
 
 Use private hosting controls for every credential and owner identifier. Keep
 `SITE_SERVICE_ACCESS_TOKEN` aligned with the hosting platform's supported service

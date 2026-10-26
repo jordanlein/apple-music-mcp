@@ -1,6 +1,13 @@
 const DEFAULT_REQUEST_TIMEOUT_MS = 10_000;
 const DEFAULT_GET_ATTEMPTS = 3;
 
+export class AppleMusicWriteUncertainError extends Error {
+  constructor(cause?: unknown) {
+    super('Apple Music write timed out or disconnected; check the library before repeating it.', {cause});
+    this.name = 'AppleMusicWriteUncertainError';
+  }
+}
+
 export class AppleMusicApiError extends Error {
   readonly status: number;
   readonly responseBody: string;
@@ -32,7 +39,7 @@ export async function fetchAppleMusicWithRetry(
 ): Promise<Response> {
   const method = (init.method ?? "GET").toUpperCase();
   const maxAttempts = method === "GET" ? (options.maxAttempts ?? DEFAULT_GET_ATTEMPTS) : 1;
-  const timeoutMs = options.timeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
+  const timeoutMs = options.timeoutMs ?? (method === 'GET' ? DEFAULT_REQUEST_TIMEOUT_MS : 30_000);
   const fetcher = options.fetcher ?? fetch;
   const sleep = options.sleep ?? defaultSleep;
 
@@ -50,6 +57,7 @@ export async function fetchAppleMusicWithRetry(
       await sleep(retryDelayMs(response.headers.get("Retry-After"), attempt));
     } catch (error) {
       if (attempt === maxAttempts) {
+        if (method !== 'GET') throw new AppleMusicWriteUncertainError(error);
         if (isAbortError(error)) {
           throw new Error(`Apple Music API request timed out after ${timeoutMs}ms`, { cause: error });
         }

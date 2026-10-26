@@ -1,13 +1,20 @@
-import { OAuthProvider } from "@cloudflare/workers-oauth-provider";
-import { createMcpHandler } from "agents/mcp";
+import type { OAuthProvider } from "@cloudflare/workers-oauth-provider";
+import { WorkerEntrypoint } from 'cloudflare:workers';
+import { hasCapabilityPath, hasCapabilityToken } from './capability-access';
+import { AppleMusicApi, type SongLookupInput } from './apple';
 import { refreshRecentListeningAnalytics } from "./analytics";
-import { createAppleMusicMcp } from "./mcp";
 import { applySecurityHeaders, HttpRequestError, readCookie, readUrlEncodedForm, secureEqual } from "./http-security";
 import { saveAppleAuthToken, setupPage } from "./setup";
 import { purgeAuditLog } from "./storage";
 import { forwardSitesCollection } from "./sites-trigger";
 import { claimScheduledMaintenance } from "./collector-control";
-import type { CloudflareEnv as Env } from "./types";
+import type { CloudflareEnv as Env, ToolContext } from "./types";
+
+// Cron and catalog RPC do not need the SDK/schema/OAuth initialization work.
+// Wrangler bundles these imports, but defers their initialization until used.
+async function handleMcp(request: Request, context: ToolContext): Promise<Response> {
+  return (await import('./mcp-http')).handleMcp(request, context);
+}
 
 const AUTH_FORM_MAX_BYTES = 2_048;
 const OAUTH_CSRF_COOKIE = "AM_MCP_CSRF";
@@ -24,8 +31,7 @@ const apiHandler = {
     if (originError) return originError;
     const props = (ctx.props ?? {}) as AuthenticatedProps;
     const clientId = props.clientId ?? props.authentication ?? props.userId ?? "authenticated-client";
-    const server = createAppleMusicMcp({ env, clientId });
-    return createMcpHandler(server)(request, env, ctx);
+    return handleMcp(request, { env, clientId });
   }
 } satisfies ExportedHandler<Env>;
 
@@ -52,15 +58,17 @@ const defaultHandler = {
       if (originError) return originError;
       const authError = await requireMcpApiKey(request, env);
       if (authError) return authError;
-      const server = createAppleMusicMcp({ env, clientId: "static-bearer" });
-      return createMcpHandler(server)(request, env, ctx);
+      return handleMcp(request, { env, clientId: "static-bearer" });
     }
 
     return new Response("Not found", { status: 404 });
   }
 } satisfies ExportedHandler<Env>;
 
-const oauthProvider = new OAuthProvider<Env>({
+let oauthProvider: OAuthProvider<Env> | undefined;
+async function getOAuthProvider(): Promise<OAuthProvider<Env>> {
+  const { OAuthProvider } = await import('@cloudflare/workers-oauth-provider');
+  return oauthProvider ??= new OAuthProvider<Env>({
   apiRoute: "/mcp",
   apiHandler,
   defaultHandler,
@@ -82,31 +90,57 @@ const oauthProvider = new OAuthProvider<Env>({
     if (env.MCP_API_KEY && await secureEqual(token, env.MCP_API_KEY)) {
       return { props: { userId: "owner", clientId: "static-bearer", authentication: "static-bearer" } };
     }
+    if (await hasCapabilityToken(token, env.POKE_MCP_API_KEY ?? env.MCP_API_KEY)) {
+      return { props: { userId: "owner", clientId: "owner-shared-url", authentication: "shared-capability-bearer" } };
+    }
     return null;
   }
 });
+}
 
 export default {
-  fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
-    return oauthProvider.fetch(request, env, ctx);
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+    const path = new URL(request.url).pathname;
+    if (await hasCapabilityPath(path, env.POKE_MCP_API_KEY ?? env.MCP_API_KEY)) {
+      const originError = rejectCrossOriginRequest(request);
+      if (originError) return originError;
+      return handleMcp(request, { env, clientId: 'owner-shared-url' });
+    }
+    return (await getOAuthProvider()).fetch(request, env, ctx);
   },
   async scheduled(_controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
-    if (env.SITE_COLLECTOR_URL || env.SITE_SERVICE_TOKEN) {
+    if (env.SITE_COLLECTOR_URL) {
       ctx.waitUntil(forwardSitesCollection(env.SITE_COLLECTOR_URL ?? '', env.SITE_SERVICE_TOKEN ?? ''));
       return;
     }
+    if (env.COLLECTOR_ACTIVE === 'false') return;
     ctx.waitUntil(
       Promise.all([
         refreshRecentListeningAnalytics(env, { limit: 30, trigger: "scheduled" }),
         (async () => {
           if (await claimScheduledMaintenance(env.DB)) {
-            await Promise.all([oauthProvider.purgeExpiredData(env, { batchSize: 100 }), purgeAuditLog(env)]);
+            await Promise.all([
+              getOAuthProvider().then(provider => provider.purgeExpiredData(env, { batchSize: 10 })),
+              purgeAuditLog(env),
+              env.DB.prepare("DELETE FROM analytics_ingest_runs WHERE started_at < ?")
+                .bind(new Date(Date.now() - 30 * 86_400_000).toISOString()).run(),
+              env.DB.prepare('DELETE FROM catalog_cache WHERE expires_at_ms < ?').bind(Date.now()).run()
+            ]);
           }
         })()
       ]).then(() => undefined)
     );
   }
 } satisfies ExportedHandler<Env>;
+
+// Private RPC keeps each catalog chunk below Free's per-invocation subrequest
+// limit. It reuses this Worker's existing secrets and has no public HTTP route.
+export class CatalogResolver extends WorkerEntrypoint<Env> {
+  async resolve(tracks: SongLookupInput[]) {
+    if (tracks.length > 10) throw new Error('Catalog chunks must contain at most ten songs');
+    return new AppleMusicApi(this.env).resolveSongIds(tracks, true);
+  }
+}
 
 async function authorize(request: Request, env: Env): Promise<Response> {
   if (request.method !== "GET" && request.method !== "POST") {

@@ -5,9 +5,11 @@ import { saveAppleAuthToken, setupPage } from "./setup";
 import { requireSitesOwner } from "./sites-access";
 import type { Env } from "./types";
 import { siteOperation, type OperationsEnv } from "./sites-operations";
+import { forwardSiteMcp } from './site-forward';
 
 interface SitesEnv extends OperationsEnv {
   SITE_OWNER_EMAIL: string;
+  CLOUDFLARE_MCP_URL?: string;
 }
 
 // Sites owns MCP OAuth and the authentication boundary. The Cloudflare OAuth
@@ -23,14 +25,19 @@ export default {
       if (request.method !== "POST") return new Response("Method not allowed", { status: 405, headers: { Allow: "POST" } });
       const origin = request.headers.get("Origin");
       if (origin && origin !== url.origin) return new Response("Cross-origin MCP requests are not allowed", { status: 403 });
+      if (env.CLOUDFLARE_MCP_URL) return forwardSiteMcp(request, env.CLOUDFLARE_MCP_URL);
       const server = createAppleMusicMcp({ env, clientId: request.headers.get("oai-authenticated-user-id")! });
-      const transport = new WebStandardStreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });
+      const transport = new WebStandardStreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true, maxRequestBodySize: 1_048_576 });
       try {
         await server.connect(transport);
         return await transport.handleRequest(request);
       } finally {
         await server.close();
       }
+    }
+    if (env.CLOUDFLARE_MCP_URL && ['/setup','/auth/apple/token'].includes(path)) {
+      if (request.method !== 'GET') return new Response('Apple Music setup moved. Open the Cloudflare setup page and reconnect there.', {status:409});
+      return Response.redirect(new URL('/setup', env.CLOUDFLARE_MCP_URL).toString(), 302);
     }
     if (url.pathname === "/setup") return setupPage(request, env);
     if (url.pathname === "/auth/apple/token" && request.method === "POST") return saveAppleAuthToken(request, env);
@@ -42,7 +49,7 @@ export default {
   // The destination MUST provision and verify an actual two-minute schedule
   // before cutover. Exporting a scheduled handler alone does not schedule it.
   async scheduled(_controller: ScheduledController, env: SitesEnv, ctx: ExecutionContext): Promise<void> {
-    if (env.SITE_COLLECTOR_ACTIVE !== 'true') return;
+    if (env.CLOUDFLARE_MCP_URL || env.SITE_COLLECTOR_ACTIVE !== 'true') return;
     ctx.waitUntil(refreshRecentListeningAnalytics(env, { trigger: "scheduled" }).then(() => undefined));
   }
 } satisfies ExportedHandler<SitesEnv>;

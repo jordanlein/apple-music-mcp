@@ -6,7 +6,16 @@ import {
   isEmptyPlaylistTracksError,
   mapWithConcurrency,
   parseRetryAfterMs,
+  AppleMusicWriteUncertainError,
 } from "../src/apple-transport.ts";
+
+test('a lost POST response has an explicit uncertain outcome and is never retried', async () => {
+  let attempts=0;
+  await assert.rejects(()=>fetchAppleMusicWithRetry('https://example.test',{method:'POST'}, {
+    fetcher:async()=>{attempts++;throw new Error('connection lost');},sleep:async()=>{}
+  }),error=>error instanceof AppleMusicWriteUncertainError);
+  assert.equal(attempts,1);
+});
 
 test("an empty playlist relationship is returned as an empty track list", async () => {
   const error = new AppleMusicApiError(

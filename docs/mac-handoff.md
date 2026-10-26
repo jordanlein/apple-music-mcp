@@ -27,7 +27,9 @@ instead of resetting. A saved stash should be restored with `git stash apply`
 and retained until conflicts and verification are complete.
 
 Compare the ignored `wrangler.toml` with `wrangler.example.toml`, retaining your
-own database and KV bindings. Duplicate editor copies of the README are ignored;
+own database and KV bindings. Retain the `CATALOG_RESOLVER` service binding,
+with `service` matching the Worker name, and keep invocation URL logging disabled
+when using a private capability URL. Duplicate editor copies of the README are ignored;
 do not stage them as a substitute for the tracked README.
 
 If repository history was sanitized, keep the old checkout and private local
@@ -57,8 +59,9 @@ git config --local user.email 'contributors@users.noreply.github.com'
 
 1. Back up the authoritative database, sequence state and existing OAuth KV.
    Verify a restore and retain the original encryption key and rollback version.
-2. Apply `0007_collector_control.sql` before deploying code that uses leases and
-   cooldowns. On Sites, apply the matching generated schema migration through
+2. Apply all pending Cloudflare migrations before deploying code, including
+   `0007_collector_control.sql` through `0010_catalog_cache.sql`. On Sites, apply
+   the matching generated schema migration through
    its supported workflow; Cloudflare migration CLI commands target Cloudflare.
 3. Set `COLLECTOR_POLL_INTERVAL_SECONDS` to `120` in the authoritative collector.
    Set the Cloudflare timer to `*/2 * * * *`. Preserve unrelated Worker bindings.

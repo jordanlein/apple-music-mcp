@@ -141,9 +141,7 @@ async function collectRecentListening(
         resourcesWithTimes[index]?.resourceHash ?? null
       );
   });
-  const stateStatements = [
-    env.DB.prepare("DELETE FROM analytics_ingest_runs WHERE started_at < datetime('now', '-30 days')")
-  ];
+  const stateStatements: D1PreparedStatement[] = [];
   // An unexpectedly empty response must not erase the preceding nonempty
   // snapshot and turn its entire returning window into apparent new plays.
   if (resources.length || !previousFingerprints.length) {

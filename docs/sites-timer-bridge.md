@@ -1,5 +1,8 @@
 # Two-minute collection on Sites with a Cloudflare timer
 
+This optional mode makes Sites the database owner. For Cloudflare-owned storage
+with an owner-private Sites proxy, use [proxy mode](clients.md#optional-owner-private-sites-proxy) instead.
+
 Sites must be the authoritative database before enabling this bridge. Follow the
 [private Site and migration checklist](sites-migration.md), reconcile every
 source row, preserve validation rows and protected backups, and keep one active
@@ -8,8 +11,8 @@ collector. Sites native scheduled tasks cannot provide a two-minute cadence.
 ## Configure the forwarding Worker
 
 Use an existing verified Cloudflare timer when migrating an existing deployment.
-The repository's `src/index.ts` selects forwarding when either bridge binding
-is present; both must be valid. Without them it remains a standalone Cloudflare
+The repository's `src/index.ts` selects forwarding when `SITE_COLLECTOR_URL`
+is set; that URL and `SITE_SERVICE_TOKEN` must both be valid. Without them it remains a standalone Cloudflare
 collector. Its MCP fetch handler is retained, but explicit refreshes through
 legacy clients still write to the source database. Reconnect clients to Sites
 for current history.
@@ -80,8 +83,8 @@ HTTP diagnostic URL is required for the timer.
 
 `*/2 * * * *` produces up to 720 ticks per day. The forwarding handler performs
 zero scheduled KV operations. Legacy MCP/OAuth client traffic can still use KV.
-Standalone Cloudflare uses an hourly maintenance lease: the usual two OAuth KV
-list scans per cleanup are about 48 per day rather than 1,440 at a two-minute
+Standalone Cloudflare uses a daily maintenance lease: the usual two OAuth KV
+list scans per cleanup are about two per day rather than 1,440 at a two-minute
 cleanup cadence. Additional KV pages and legacy client traffic can add usage.
 
 Cloudflare's Free allowance includes 1,000 KV list requests daily, resetting at

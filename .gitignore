@@ -3,14 +3,31 @@ node_modules/
 work/
 outputs/
 .dev.vars
+.dev.vars.*
+!.dev.vars.example
+.env
+.env.*
+!.env.example
 wrangler.toml
 .DS_Store
 *.log
 
 # Keep signing keys and account-specific hosting configuration local.
 *.p8
+*.pem
+*.key
+*.sqlite
+*.sqlite3
+*.db
+*.sql.gz
+*.bundle
 .openai/hosting.json
+
+# Private operational notes contain account IDs and migration evidence.
+/docs/20??-??-??-cloudflare-return-*.md
+/docs/private/
 
 # Generated Site artifacts and local editor duplicates.
 dist/
+worker-configuration.d.ts
 README [0-9]*.md

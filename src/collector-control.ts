@@ -44,7 +44,7 @@ export async function recordRateLimitCooldown(db: D1Database, delayMs: number, n
 }
 
 export async function claimScheduledMaintenance(db: D1Database, now = Date.now()) {
-  // Retain this lease for the full hour, including when cleanup fails, so a
+  // Retain this lease for the full day, including when cleanup fails, so a
   // repeated failure cannot turn every collection tick into another KV scan.
-  return (await acquireLease(db, 'scheduled_maintenance', crypto.randomUUID(), now, 3_600_000)).acquired;
+  return (await acquireLease(db, 'scheduled_maintenance', crypto.randomUUID(), now, 86_400_000)).acquired;
 }

@@ -182,7 +182,7 @@ test('an expired writer cannot commit after a successor takes the lease or relea
   assert.equal(sqlite.prepare("SELECT owner FROM collector_control WHERE name='recently_played'").get()!.owner, 'successor');
 });
 
-test('leases recover after crashes and standalone KV maintenance is claimed only once an hour', async (t) => {
+test('leases recover after crashes and standalone KV maintenance is claimed only once a day', async (t) => {
   const {sqlite, env} = database(); t.after(() => sqlite.close());
   const {acquireLease, claimScheduledMaintenance, recordRateLimitCooldown, COLLECTION_CONTROL} = await import('../src/collector-control.ts');
   const now = Date.now();
@@ -194,7 +194,8 @@ test('leases recover after crashes and standalone KV maintenance is claimed only
   assert.equal((await acquireLease(env.DB, COLLECTION_CONTROL, 'retry', now + 400_000)).acquired, true);
   assert.equal(await claimScheduledMaintenance(env.DB, now), true);
   assert.equal(await claimScheduledMaintenance(env.DB, now + 120_000), false);
-  assert.equal(await claimScheduledMaintenance(env.DB, now + 3_600_000), true);
+  assert.equal(await claimScheduledMaintenance(env.DB, now + 3_600_000), false);
+  assert.equal(await claimScheduledMaintenance(env.DB, now + 86_400_000), true);
 });
 
 

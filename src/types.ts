@@ -20,6 +20,11 @@ export interface CloudflareEnv extends Env {
   OAUTH_PROVIDER: OAuthHelpers;
   SITE_COLLECTOR_URL?: string;
   SITE_SERVICE_TOKEN?: string;
+  POKE_MCP_API_KEY?: string;
+  COLLECTOR_ACTIVE?: string;
+  CATALOG_RESOLVER?: {
+    resolve(tracks: Array<{ id?: string; term?: string; name?: string; artist?: string }>): Promise<import('./apple').SongResolutionBatch>;
+  };
 }
 
 export interface AppleTokenSet {

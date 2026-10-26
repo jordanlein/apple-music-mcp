@@ -1,6 +1,6 @@
 import { signEs256Jwt } from "./crypto";
 import { getConfig, loadAppleToken, setConfig } from "./storage";
-import type { AppleListResponse, AppleResource, Env } from "./types";
+import type { AppleListResponse, AppleResource, AppleTokenSet, CloudflareEnv, Env } from "./types";
 import {
   AppleMusicApiError,
   fetchAppleMusicWithRetry,
@@ -10,8 +10,8 @@ import {
 import { chooseSongMatch } from "./song-matching";
 
 const API_BASE = "https://api.music.apple.com/v1";
-const SONG_LOOKUP_CONCURRENCY = 4;
 const SONG_LOOKUP_CANDIDATES = 10;
+let developerTokenCache: { key: string; expiresAt: number; token: Promise<string> } | undefined;
 
 export type SongLookupInput = { id?: string; term?: string; name?: string; artist?: string };
 export type ResolvedSong = {
@@ -39,6 +39,10 @@ export type SongResolutionBatch = {
 
 export class AppleMusicApi {
   private readonly env: Env;
+  private storefront?: Promise<string>;
+  private userToken?: Promise<AppleTokenSet | null>;
+  private upstreamRequests = 0;
+  private cooldownUntil = 0;
 
   constructor(env: Env) {
     this.env = env;
@@ -53,21 +57,27 @@ export class AppleMusicApi {
     if (!Number.isInteger(ttl) || ttl < 300 || ttl > 15_777_000) {
       throw new Error("APPLE_DEVELOPER_TOKEN_TTL_SECONDS must be an integer from 300 through 15777000.");
     }
-    return signEs256Jwt(
+    const cacheKey = [this.env.APPLE_TEAM_ID, this.env.APPLE_KEY_ID, this.env.APPLE_PRIVATE_KEY, ttl].join('\n');
+    if (developerTokenCache?.key === cacheKey && developerTokenCache.expiresAt > now + 60) return developerTokenCache.token;
+    const token = signEs256Jwt(
       { alg: "ES256", kid: this.env.APPLE_KEY_ID },
       { iss: this.env.APPLE_TEAM_ID, iat: now, exp: now + ttl },
       this.env.APPLE_PRIVATE_KEY
     );
+    developerTokenCache = { key: cacheKey, expiresAt: now + ttl, token };
+    token.catch(() => { if (developerTokenCache?.token === token) developerTokenCache = undefined; });
+    return token;
   }
 
   async userStorefront(): Promise<string> {
-    return (await getConfig(this.env, "apple_storefront")) ?? this.env.APPLE_STOREFRONT ?? "us";
+    return this.storefront ??= getConfig(this.env, "apple_storefront").then(value => value ?? this.env.APPLE_STOREFRONT ?? 'us');
   }
 
   async refreshAndStoreStorefront(): Promise<string> {
     const response = await this.request("/me/storefront", { user: true });
     const storefront = response.data?.[0]?.id ?? this.env.APPLE_STOREFRONT ?? "us";
     await setConfig(this.env, "apple_storefront", storefront);
+    this.storefront = Promise.resolve(storefront);
     return storefront;
   }
 
@@ -104,12 +114,19 @@ export class AppleMusicApi {
 
   async searchCatalog(term: string, types: string, limit: number): Promise<Record<string, AppleResource[]>> {
     const storefront = await this.userStorefront();
+    const cacheKey = JSON.stringify([storefront, term.trim().toLowerCase(), types, Math.min(limit, 25)]);
+    const cacheEnabled = Boolean((this.env as CloudflareEnv).CATALOG_RESOLVER);
+    const cached = cacheEnabled ? await this.env.DB.prepare('SELECT value FROM catalog_cache WHERE key = ? AND expires_at_ms > ?')
+      .bind(cacheKey, Date.now()).first<{value: string}>() : null;
+    if (cached) return JSON.parse(cached.value);
     const path = `/catalog/${encodeURIComponent(storefront)}/search?types=${encodeURIComponent(types)}&limit=${Math.min(limit, 25)}&term=${encodeURIComponent(term)}`;
     const response = await this.request(path, { user: false });
     const results: Record<string, AppleResource[]> = {};
     for (const [key, value] of Object.entries(response.results ?? {})) {
       results[key] = value.data ?? [];
     }
+    if (cacheEnabled) await this.env.DB.prepare('INSERT INTO catalog_cache (key,value,expires_at_ms) VALUES (?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,expires_at_ms=excluded.expires_at_ms')
+      .bind(cacheKey, JSON.stringify(results), Date.now() + 86_400_000).run();
     return results;
   }
 
@@ -140,8 +157,37 @@ export class AppleMusicApi {
     }
   }
 
-  async resolveSongIds(tracks: SongLookupInput[]): Promise<SongResolutionBatch> {
-    const outcomes = await mapWithConcurrency(tracks, SONG_LOOKUP_CONCURRENCY, async (track, inputIndex) => {
+  async resolveSongIds(tracks: SongLookupInput[], local = false): Promise<SongResolutionBatch> {
+    if (!local) {
+      const groups = new Map<string, {track: SongLookupInput; indices: number[]}>();
+      tracks.forEach((track,index) => { const key = JSON.stringify(track); const group = groups.get(key); if (group) group.indices.push(index); else groups.set(key,{track,indices:[index]}); });
+      if (groups.size < tracks.length) {
+        const unique = Array.from(groups.values());
+        const result = await this.resolveSongIds(unique.map(g=>g.track));
+        return {
+          resolved: result.resolved.flatMap(item=>unique[item.inputIndex].indices.map(inputIndex=>({...item,inputIndex}))).sort((a,b)=>a.inputIndex-b.inputIndex),
+          unresolved: result.unresolved.flatMap(item=>unique[item.inputIndex].indices.map(inputIndex=>({...item,inputIndex,input:tracks[inputIndex]}))).sort((a,b)=>a.inputIndex-b.inputIndex),
+          ambiguous: result.ambiguous.flatMap(item=>unique[item.inputIndex].indices.map(inputIndex=>({...item,inputIndex,input:tracks[inputIndex]}))).sort((a,b)=>a.inputIndex-b.inputIndex)
+        };
+      }
+    }
+    const resolver = (this.env as CloudflareEnv).CATALOG_RESOLVER;
+    if (!local && resolver && tracks.some(track => !track.id)) {
+      const batches = chunks(tracks, 10);
+      const results = await mapWithConcurrency(batches, 1, chunk => resolver.resolve(chunk));
+      const combined: SongResolutionBatch = { resolved: [], unresolved: [], ambiguous: [] };
+      results.forEach((result, batchIndex) => {
+        for (const key of ['resolved', 'unresolved', 'ambiguous'] as const) {
+          for (const item of result[key]) {
+            const adjusted = { ...item, inputIndex: item.inputIndex + batchIndex * 10 };
+            if (key === 'resolved') combined.resolved.push(adjusted as SongResolutionBatch['resolved'][number]);
+            else combined[key].push(adjusted as SongResolutionIssue);
+          }
+        }
+      });
+      return combined;
+    }
+    const outcomes = await mapWithConcurrency(tracks, 1, async (track, inputIndex) => {
       if (track.id) {
         return {
           status: "resolved" as const,
@@ -164,6 +210,7 @@ export class AppleMusicApi {
         };
       }
       const results = await this.searchCatalog(term, "songs", SONG_LOOKUP_CANDIDATES);
+      if (local && tracks.length > 1) await new Promise(resolve => setTimeout(resolve, 250));
       return chooseSongMatch(track, term, results.songs ?? [], inputIndex);
     });
     const batch: SongResolutionBatch = { resolved: [], unresolved: [], ambiguous: [] };
@@ -190,11 +237,15 @@ export class AppleMusicApi {
   }
 
   protected async request(path: string, options: RequestOptions): Promise<AppleListResponse> {
+    const control = await this.env.DB.prepare("SELECT cooldown_until_ms FROM collector_control WHERE name = 'recently_played'")
+      .first<{cooldown_until_ms: number}>();
+    this.cooldownUntil = Math.max(this.cooldownUntil, control?.cooldown_until_ms ?? 0);
+    if (this.cooldownUntil > Date.now()) throw new AppleMusicApiError(429, 'Apple Music is cooling down after a rate limit', String(Math.ceil((this.cooldownUntil - Date.now()) / 1000)));
     const headers: Record<string, string> = {
       Authorization: `Bearer ${await this.developerToken()}`
     };
     if (options.user) {
-      const token = await loadAppleToken(this.env);
+      const token = await (this.userToken ??= loadAppleToken(this.env));
       if (!token?.musicUserToken) throw new Error("Apple Music is not connected. Open /setup with the setup token and authorize Apple Music.");
       headers["Music-User-Token"] = token.musicUserToken;
     }
@@ -204,12 +255,24 @@ export class AppleMusicApi {
       method: options.method ?? "GET",
       headers,
       body: options.body ? JSON.stringify(options.body) : undefined
+    }, {
+      fetcher: async (input, init) => {
+        // Reserve room for OAuth, D1, and private RPC calls in the caller.
+        if (++this.upstreamRequests > 35) throw new Error('Apple request budget reached; continue verification separately');
+        return fetch(input, init);
+      }
     });
 
     if (options.emptyOk && (response.status === 202 || response.status === 204)) return {};
     if (!response.ok) {
       const text = await response.text();
-      throw new AppleMusicApiError(response.status, text, response.headers.get('Retry-After'));
+      const error = new AppleMusicApiError(response.status, text, response.headers.get('Retry-After'));
+      if (response.status === 429) {
+        this.cooldownUntil = Date.now() + Math.max(error.retryAfterMs ?? 300_000, 60_000);
+        await this.env.DB.prepare("INSERT INTO collector_control(name,owner,lease_until_ms,cooldown_until_ms) VALUES('recently_played','',0,?) ON CONFLICT(name) DO UPDATE SET cooldown_until_ms=MAX(cooldown_until_ms,excluded.cooldown_until_ms)")
+          .bind(this.cooldownUntil).run();
+      }
+      throw error;
     }
     if (response.status === 204) return {};
     return response.json<AppleListResponse>();
